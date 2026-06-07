@@ -214,6 +214,21 @@ extension WhoopStore {
             try db.create(index: "idx_metricSeries_device_key_day",
                           on: "metricSeries", columns: ["deviceId", "key", "day"])
         }
+        migrator.registerMigration("v10") { db in
+            // Outbox for the DefraDB sync mirror. When the sidecar is unreachable, upserts get
+            // queued here and drained on reconnect. Natural key (collection, naturalKey) coalesces
+            // repeated offline updates of the same row down to one pending mutation.
+            try db.create(table: "defra_outbox") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("collection", .text).notNull()
+                t.column("naturalKey", .text).notNull()
+                t.column("payloadJSON", .text).notNull()
+                t.column("enqueuedAt", .integer).notNull()
+                t.column("attempts", .integer).notNull().defaults(to: 0)
+            }
+            try db.create(index: "idx_defra_outbox_coll_key",
+                          on: "defra_outbox", columns: ["collection", "naturalKey"], unique: true)
+        }
         return migrator
     }
 }

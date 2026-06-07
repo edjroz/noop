@@ -6,7 +6,22 @@ import WhoopProtocol
 /// transient, compressed, prunable outbox. Built on GRDB/SQLite.
 public enum WhoopStoreInfo {
     /// Bumped whenever the migrator gains a new migration.
-    public static let schemaVersion = 9
+    public static let schemaVersion = 10
+}
+
+/// Observer hook invoked after a successful upsert into one of the synced metric-cache tables.
+/// Fires from a detached Task so a slow/failing observer cannot backpressure the writer.
+/// The mirror layer (DefraSync) implements this to publish rows out to the DefraDB sidecar.
+/// The observer must not call back into the same WhoopStore methods on the same row or it will
+/// recurse forever — the inbound apply path suppresses this with `SyncContext.applyingFromDefra`
+/// (a `@TaskLocal` declared in DefraSync). WhoopStore itself doesn't depend on that flag; the
+/// observer's caller is responsible for setting it before re-entering upserts.
+///
+/// Payload shape: one JSON object string per row, containing the natural-key columns plus every
+/// column the upsert wrote. Using JSON strings rather than `[String: Any]` keeps the protocol
+/// Sendable-clean.
+public protocol WhoopStoreObserver: Sendable {
+    func didUpsert(collection: String, deviceId: String, payloadsJSON: [String]) async
 }
 
 /// WhoopStore is an `actor`: its public API is `async`, and all GRDB work runs on the
@@ -15,6 +30,22 @@ public enum WhoopStoreInfo {
 /// non-blocking). That is the intended off-main win — DatabaseQueue kept, not DatabasePool.
 public actor WhoopStore {
     let dbQueue: DatabaseQueue
+    private var observer: WhoopStoreObserver?
+
+    /// Wire an observer that gets called after each successful upsert into a synced collection.
+    /// The observer must itself decide whether to skip a notification — WhoopStore cannot see
+    /// the inbound-apply @TaskLocal that lives in DefraSync. Loop prevention is the observer's job.
+    public func setObserver(_ obs: WhoopStoreObserver?) { self.observer = obs }
+
+    /// Fire the observer (no-op if unset). Called from the upsert sites after `syncWrite` returns.
+    /// Uses a child `Task { ... }` (not `Task.detached`) so `@TaskLocal` values set by the inbound
+    /// apply path propagate into the observer — that's what lets `DefraSyncer.didUpsert` see
+    /// `SyncContext.applyingFromDefra == true` and skip re-publishing the row. The Task still
+    /// returns immediately from the writer's POV — observer work happens on its own executor.
+    func notifyObserver(collection: String, deviceId: String, payloadsJSON: [String]) {
+        guard !payloadsJSON.isEmpty, let obs = observer else { return }
+        Task { await obs.didUpsert(collection: collection, deviceId: deviceId, payloadsJSON: payloadsJSON) }
+    }
 
     private init(dbQueue: DatabaseQueue) throws {
         self.dbQueue = dbQueue

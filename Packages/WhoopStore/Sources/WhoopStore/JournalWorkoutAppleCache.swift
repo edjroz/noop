@@ -70,7 +70,7 @@ extension WhoopStore {
     /// Upsert journal entries. Natural key (deviceId, day, question). Returns rows changed.
     @discardableResult
     public func upsertJournal(_ rows: [JournalEntry], deviceId: String) async throws -> Int {
-        try syncWrite { db in
+        let n = try syncWrite { db in
             var n = 0
             for r in rows {
                 try db.execute(sql: """
@@ -85,12 +85,26 @@ extension WhoopStore {
             }
             return n
         }
+        notifyObserver(
+            collection: "journal",
+            deviceId: deviceId,
+            payloadsJSON: ObserverPayload.encodeAll(rows.map { r in
+                [
+                    "deviceId": deviceId,
+                    "day": r.day,
+                    "question": r.question,
+                    "answeredYes": r.answeredYes,
+                    "notes": r.notes,
+                ]
+            })
+        )
+        return n
     }
 
     /// Upsert workouts. Natural key (deviceId, startTs, sport). Returns rows changed.
     @discardableResult
     public func upsertWorkouts(_ rows: [WorkoutRow], deviceId: String) async throws -> Int {
-        try syncWrite { db in
+        let n = try syncWrite { db in
             var n = 0
             for r in rows {
                 try db.execute(sql: """
@@ -116,12 +130,34 @@ extension WhoopStore {
             }
             return n
         }
+        notifyObserver(
+            collection: "workout",
+            deviceId: deviceId,
+            payloadsJSON: ObserverPayload.encodeAll(rows.map { r in
+                [
+                    "deviceId": deviceId,
+                    "startTs": r.startTs,
+                    "endTs": r.endTs,
+                    "sport": r.sport,
+                    "source": r.source,
+                    "durationS": r.durationS,
+                    "energyKcal": r.energyKcal,
+                    "avgHr": r.avgHr,
+                    "maxHr": r.maxHr,
+                    "strain": r.strain,
+                    "distanceM": r.distanceM,
+                    "zonesJSON": r.zonesJSON,
+                    "notes": r.notes,
+                ]
+            })
+        )
+        return n
     }
 
     /// Upsert Apple-Health daily aggregates. Natural key (deviceId, day). Returns rows changed.
     @discardableResult
     public func upsertAppleDaily(_ rows: [AppleDaily], deviceId: String) async throws -> Int {
-        try syncWrite { db in
+        let n = try syncWrite { db in
             var n = 0
             for r in rows {
                 try db.execute(sql: """
@@ -144,6 +180,25 @@ extension WhoopStore {
             }
             return n
         }
+        notifyObserver(
+            collection: "appleDaily",
+            deviceId: deviceId,
+            payloadsJSON: ObserverPayload.encodeAll(rows.map { r in
+                [
+                    "deviceId": deviceId,
+                    "day": r.day,
+                    "steps": r.steps,
+                    "activeKcal": r.activeKcal,
+                    "basalKcal": r.basalKcal,
+                    "vo2max": r.vo2max,
+                    "avgHr": r.avgHr,
+                    "maxHr": r.maxHr,
+                    "walkingHr": r.walkingHr,
+                    "weightKg": r.weightKg,
+                ]
+            })
+        )
+        return n
     }
 
     // MARK: - Reads

@@ -63,7 +63,7 @@ extension WhoopStore {
     /// Upsert cached sleep sessions. Natural key (deviceId, startTs). Returns rows changed.
     @discardableResult
     public func upsertSleepSessions(_ sessions: [CachedSleepSession], deviceId: String) async throws -> Int {
-        try syncWrite { db in
+        let n = try syncWrite { db in
             var n = 0
             for s in sessions {
                 try db.execute(sql: """
@@ -82,12 +82,28 @@ extension WhoopStore {
             }
             return n
         }
+        notifyObserver(
+            collection: "sleepSession",
+            deviceId: deviceId,
+            payloadsJSON: ObserverPayload.encodeAll(sessions.map { s in
+                [
+                    "deviceId": deviceId,
+                    "startTs": s.startTs,
+                    "endTs": s.endTs,
+                    "efficiency": s.efficiency,
+                    "restingHr": s.restingHr,
+                    "avgHrv": s.avgHrv,
+                    "stagesJSON": s.stagesJSON,
+                ]
+            })
+        )
+        return n
     }
 
     /// Upsert cached daily metrics. Natural key (deviceId, day). Returns rows changed.
     @discardableResult
     public func upsertDailyMetrics(_ days: [DailyMetric], deviceId: String) async throws -> Int {
-        try syncWrite { db in
+        let n = try syncWrite { db in
             var n = 0
             for d in days {
                 try db.execute(sql: """
@@ -119,6 +135,31 @@ extension WhoopStore {
             }
             return n
         }
+        notifyObserver(
+            collection: "dailyMetric",
+            deviceId: deviceId,
+            payloadsJSON: ObserverPayload.encodeAll(days.map { d in
+                [
+                    "deviceId": deviceId,
+                    "day": d.day,
+                    "totalSleepMin": d.totalSleepMin,
+                    "efficiency": d.efficiency,
+                    "deepMin": d.deepMin,
+                    "remMin": d.remMin,
+                    "lightMin": d.lightMin,
+                    "disturbances": d.disturbances,
+                    "restingHr": d.restingHr,
+                    "avgHrv": d.avgHrv,
+                    "recovery": d.recovery,
+                    "strain": d.strain,
+                    "exerciseCount": d.exerciseCount,
+                    "spo2Pct": d.spo2Pct,
+                    "skinTempDevC": d.skinTempDevC,
+                    "respRateBpm": d.respRateBpm,
+                ]
+            })
+        )
+        return n
     }
 
     // MARK: - Reads

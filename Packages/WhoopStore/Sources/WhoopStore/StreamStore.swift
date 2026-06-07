@@ -135,15 +135,19 @@ extension WhoopStore {
     public func storageStats_rowCountsForTest() async throws
         -> (hr: Int, rr: Int, events: Int, battery: Int,
             spo2: Int, skinTemp: Int, resp: Int, gravity: Int) {
-        try syncRead { db in
-            (try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM hrSample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM rrInterval") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM event") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM battery") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM spo2Sample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM skinTempSample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM respSample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM gravitySample") ?? 0)
+        // Broken into explicit lets — the inline 8-tuple of `try`-expressions trips Swift's
+        // type-checker into a multi-second backtrack.
+        return try syncRead { db in
+            let hr = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM hrSample") ?? 0
+            let rr = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM rrInterval") ?? 0
+            let events = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM event") ?? 0
+            let battery = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM battery") ?? 0
+            let spo2 = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM spo2Sample") ?? 0
+            let skinTemp = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM skinTempSample") ?? 0
+            let resp = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM respSample") ?? 0
+            let gravity = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM gravitySample") ?? 0
+            return (hr: hr, rr: rr, events: events, battery: battery,
+                    spo2: spo2, skinTemp: skinTemp, resp: resp, gravity: gravity)
         }
     }
 
