@@ -39,3 +39,33 @@ struct ComingSoon: View {
         .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 14))
     }
 }
+
+/// A reusable "what shows now vs what needs an import" note. Bold title line plus a
+/// body line, with an info/sparkles SF Symbol. Used for empty/pending data states so
+/// every screen explains the live-now path and the import path with timing.
+struct DataPendingNote: View {
+    let title: String
+    let message: String
+    var symbol: String = "sparkles"
+
+    var body: some View {
+        StrandCard(padding: 20) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: symbol)
+                    .font(StrandFont.headline)
+                    .foregroundStyle(StrandPalette.accent)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(title)
+                        .font(StrandFont.headline)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(message)
+                        .font(StrandFont.subhead)
+                        .foregroundStyle(StrandPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+}

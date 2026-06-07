@@ -110,9 +110,7 @@ struct InsightsView: View {
                         // No journal yet — explain, but still surface relationships if
                         // the loaded series are non-empty (data-display rule).
                         NoopCard {
-                            Text("No journal answers yet. Log behaviours in your Whoop journal — "
-                                + "things like alcohol, caffeine, late meals or meditation — and Insights "
-                                + "will measure how each one moves your recovery, HRV, sleep and resting heart rate.")
+                            Text("Insights read your journal and outcomes. Import your WHOOP export, which includes your journal, in Data Sources to unlock them.")
                                 .font(StrandFont.subhead)
                                 .foregroundStyle(StrandPalette.textSecondary)
                                 .fixedSize(horizontal: false, vertical: true)

@@ -394,22 +394,10 @@ private fun androidx.compose.foundation.layout.ColumnScope.StressLoading() {
 
 @Composable
 private fun androidx.compose.foundation.layout.ColumnScope.StressEmpty() {
-    NoopCard {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(160.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                "A 0–3 stress gauge from HRV and resting heart rate, with a multi-range " +
-                    "trend. Wear your strap to populate it.",
-                style = NoopType.subhead,
-                color = Palette.textTertiary,
-                textAlign = TextAlign.Center,
-            )
-        }
-    }
+    DataPendingNote(
+        title = "No stress history yet",
+        body = "No stress history yet. Import your WHOOP export in Data Sources to see it.",
+    )
 }
 
 // MARK: - Semicircular stress gauge (0–3, blue → mint → amber sweep)

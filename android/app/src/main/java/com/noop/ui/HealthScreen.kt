@@ -1,7 +1,5 @@
 package com.noop.ui
 
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,7 +16,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.noop.ble.LiveState
@@ -339,24 +336,9 @@ private fun vitalsFor(d: DailyMetric?): List<Vital> = listOf(
 
 @Composable
 private fun HealthEmptyState() {
-    val color by animateColorAsState(
-        Palette.textSecondary, tween(Motion.durationStandard), label = "emptyColor",
+    DataPendingNote(
+        title = "No biometrics yet",
+        body = "No biometrics yet. Import your WHOOP export (and Apple Health if you " +
+            "have it) in Data Sources to fill this in.",
     )
-    NoopCard(padding = 24.dp) {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Overline("No Vitals Yet")
-            Text(
-                text = "Connect your strap to stream live heart rate, or import a WHOOP " +
-                    "export to see respiratory rate, blood oxygen, resting heart rate, " +
-                    "HRV and skin temperature.",
-                style = NoopType.subhead,
-                color = color,
-                textAlign = TextAlign.Center,
-            )
-        }
-    }
 }

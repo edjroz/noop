@@ -25,6 +25,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoGraph
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -74,6 +77,33 @@ fun NoopCard(
             .padding(padding),
     ) {
         content()
+    }
+}
+
+// MARK: - DataPendingNote — the shared "what shows now vs what needs an import" banner
+//
+// A NoopCard with a leading AutoGraph glyph, a bold title and a body line. Every data
+// screen drops one of these in its empty/partial state so the user always knows what is
+// live now and what an import will backfill. Copy is passed verbatim by the call site.
+
+@Composable
+fun DataPendingNote(title: String, body: String, modifier: Modifier = Modifier) {
+    NoopCard(modifier = modifier, padding = 18.dp) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Icon(
+                Icons.Filled.AutoGraph,
+                contentDescription = null,
+                tint = Palette.accent,
+                modifier = Modifier.size(20.dp),
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(title, style = NoopType.headline, color = Palette.textPrimary)
+                Text(body, style = NoopType.subhead, color = Palette.textSecondary)
+            }
+        }
     }
 }
 

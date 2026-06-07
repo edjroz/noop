@@ -108,26 +108,11 @@ fun WorkoutsScreen(vm: AppViewModel) {
 
 @Composable
 private fun EmptyWorkouts(loaded: Boolean) {
-    NoopCard(padding = 28.dp) {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Icon(Icons.Filled.FitnessCenter, contentDescription = null, tint = Palette.textTertiary)
-            Overline(if (loaded) "No sessions yet" else "Loading", color = Palette.textSecondary)
-            Text(
-                if (loaded) {
-                    "No workouts have synced yet. Log a session on the strap or sync Apple Health, and it will appear here."
-                } else {
-                    "Loading your sessions…"
-                },
-                style = NoopType.footnote,
-                color = Palette.textTertiary,
-                textAlign = TextAlign.Center,
-            )
-        }
-    }
+    DataPendingNote(
+        title = "No workouts yet",
+        body = "No workouts yet. They come from your WHOOP and Apple Health history. " +
+            "Import in Data Sources to bring them in.",
+    )
 }
 
 // MARK: - Range control

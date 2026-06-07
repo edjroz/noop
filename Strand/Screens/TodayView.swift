@@ -40,6 +40,12 @@ struct TodayView: View {
         ScreenScaffold(title: "Control Center", subtitle: dateLine) {
             VStack(alignment: .leading, spacing: NoopMetrics.sectionGap) {
                 HealthAlertBanner()
+                if repo.today?.recovery == nil {
+                    DataPendingNote(
+                        title: "Live now. Your scores are building.",
+                        message: "Your live heart rate is working from the strap, and recovery, strain and sleep build from it over your next few nights of wear. Want your full history instantly? Import your WHOOP export in Data Sources and it backfills in about a minute."
+                    )
+                }
                 heroSection
                 metricsSection
                 workoutsSection

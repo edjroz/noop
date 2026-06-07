@@ -45,9 +45,9 @@ import kotlin.math.roundToInt
 //     a column on appleDaily (resting_hr, hrv, spo2, resp_rate, asleep_min, body_fat,
 //     lean_mass, bmi), also under deviceId "apple-health".
 //
-// The Apple Health *import* itself is performed on the desktop app — the phone never
-// computes these; it reads the offline cache. When nothing has been synced we say so
-// (no faked data, no generic "coming soon").
+// The Apple Health *import* runs on-device now: pick an Apple Health export .zip in
+// Data Sources and it backfills these tables. This page just reads the resulting cache.
+// When nothing has been imported we say so (no faked data, no generic "coming soon").
 
 private const val APPLE_DEVICE = "apple-health"
 
@@ -240,19 +240,11 @@ private fun LoadingCard() {
 
 @Composable
 private fun EmptyState() {
-    NoopCard(padding = 18.dp) {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Overline("Apple Health")
-            Text("No Apple Health data yet", style = NoopType.title2, color = Palette.textPrimary)
-            Text(
-                "Apple Health import runs on the desktop app — point it at your Health export to " +
-                    "thread steps, heart, sleep, body composition and VO₂ max into Strand. " +
-                    "Once synced, this device reads the cache and these charts fill in.",
-                style = NoopType.subhead,
-                color = Palette.textSecondary,
-            )
-        }
-    }
+    DataPendingNote(
+        title = "Nothing imported yet",
+        body = "Nothing imported yet. On an iPhone: Health app, tap your photo, Export " +
+            "All Health Data, then import the .zip here in Data Sources.",
+    )
 }
 
 // MARK: - Metric tiles (uniform fixed-height StatTiles, two per row)

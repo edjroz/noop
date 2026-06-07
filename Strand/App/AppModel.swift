@@ -69,6 +69,19 @@ final class AppModel: ObservableObject {
 
         moments = (UserDefaults.standard.array(forKey: "moments") as? [Double] ?? [])
             .map { Date(timeIntervalSince1970: $0) }
+
+        // Turn the strap's offloaded raw data into dashboard scores on launch and every 15
+        // minutes, so recovery / strain / sleep populate from the strap itself with no import.
+        // IntelligenceEngine computes, persists under "my-whoop-noop", and refreshes the dashboard.
+        Task { [weak self] in
+            guard let self else { return }
+            await self.repo.refresh()                          // surface any imported data at once
+            try? await Task.sleep(nanoseconds: 6_000_000_000)  // give the first offload a moment
+            while !Task.isCancelled {
+                await self.intelligence.analyzeRecent()
+                try? await Task.sleep(nanoseconds: 900_000_000_000)  // 15 min, matches the offload cadence
+            }
+        }
     }
 
     /// Fold a fresh reading into the smoothing window and republish a stable bpm.

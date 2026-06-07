@@ -86,7 +86,7 @@ fun SleepScreen(vm: AppViewModel) {
 
     ScreenScaffold(title = "Sleep", subtitle = "Last night, read in two seconds.") {
         if (model == null) {
-            SleepEmptyState(hasDays = days.isNotEmpty())
+            SleepEmptyState()
         } else {
             Hero(model)
             Spacer(Modifier.height(Metrics.sectionGap - 20.dp))
@@ -489,29 +489,12 @@ private fun SparkTile(
 // MARK: - Empty state
 
 @Composable
-private fun SleepEmptyState(hasDays: Boolean) {
-    NoopCard(padding = 28.dp) {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Overline("Sleep", color = Palette.accent)
-            Text(
-                if (hasDays) "No stage data yet" else "Loading your sleep history…",
-                style = NoopType.title2,
-                color = Palette.textPrimary,
-            )
-            Text(
-                if (hasDays) {
-                    "Sync your strap so last night's stage breakdown, performance and trends appear here."
-                } else {
-                    "Connect your strap to begin syncing nights."
-                },
-                style = NoopType.subhead,
-                color = Palette.textSecondary,
-            )
-        }
-    }
+private fun SleepEmptyState() {
+    DataPendingNote(
+        title = "No nights here yet",
+        body = "No nights here yet. Import your WHOOP export in Data Sources to see " +
+            "every night, your sleep stages and trends straight away.",
+    )
 }
 
 // MARK: - Model + derivation (faithful to SleepView.swift)

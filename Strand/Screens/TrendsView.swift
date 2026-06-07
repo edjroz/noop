@@ -164,7 +164,7 @@ struct TrendsView: View {
         ScreenScaffold(title: "Trends", subtitle: "The thread of you over time.") {
             if repo.days.isEmpty {
                 ComingSoon(what: repo.loaded
-                    ? "No history yet. Import your Whoop export in Data Sources, or wear the strap to start the thread."
+                    ? "Trends need history to draw. Import your WHOOP export in Data Sources to see weeks, months and years instantly."
                     : "Loading your history…")
             } else {
                 // Resolve each metric's window ONCE per body and pass the results

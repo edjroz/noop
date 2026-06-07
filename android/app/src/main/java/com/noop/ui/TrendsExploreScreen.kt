@@ -231,6 +231,16 @@ fun TrendsExploreScreen(vm: AppViewModel) {
 
     ScreenScaffold(title = "Explore", subtitle = "Every signal, one tap deep.") {
 
+        // Nothing to explore until history is imported — lead with the verbatim note so
+        // the empty picker/chart below is explained.
+        if (series.isEmpty()) {
+            DataPendingNote(
+                title = "Import your history first",
+                body = "Import your history first. A WHOOP export in Data Sources fills " +
+                    "every metric you can explore here in about a minute.",
+            )
+        }
+
         // METRIC PICKER — a horizontal row of selectable chips (replaces the macOS
         // grouped catalog list; one tap selects the metric to chart).
         SectionHeader("Metric", overline = "Pick a signal", trailing = "${metrics.size}")

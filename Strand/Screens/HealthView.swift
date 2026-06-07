@@ -49,7 +49,7 @@ struct HealthView: View {
     // MARK: - Empty state
 
     private var emptyState: some View {
-        ComingSoon(what: "No vitals yet. Connect your strap to stream live heart rate, or import a WHOOP export to see respiratory rate, blood oxygen, resting heart rate, HRV and skin temperature.")
+        ComingSoon(what: "No biometrics yet. Import your WHOOP export (and Apple Health if you have it) in Data Sources to fill this in.")
     }
 }
 

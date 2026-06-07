@@ -281,7 +281,7 @@ struct StressView: View {
     // MARK: Empty state
 
     private var emptyState: some View {
-        ComingSoon(what: "A 0–3 stress gauge from HRV and resting heart rate, with a multi-range trend. Import a history or wear your strap to populate it.")
+        ComingSoon(what: "No stress history yet. Import your WHOOP export in Data Sources to see it.")
     }
 }
 

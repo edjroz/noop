@@ -416,13 +416,15 @@ fun CompareScreen(vm: AppViewModel) {
         } else {
             val nonEmpty = activeSeries.filter { it.rows.isNotEmpty() }
             if (nonEmpty.isEmpty()) {
-                EmptyNote(
-                    if (loadedOnce) {
-                        "No data for these metrics in ${range.phrase}. Widen the range or pick metrics you've logged."
-                    } else {
-                        "Reading your history…"
-                    },
-                )
+                if (loadedOnce) {
+                    DataPendingNote(
+                        title = "Compare needs at least two metrics with history",
+                        body = "Compare needs at least two metrics with history. Import your " +
+                            "WHOOP export in Data Sources first.",
+                    )
+                } else {
+                    EmptyNote("Reading your history…")
+                }
             } else {
                 OverlaySection(nonEmpty, range, anyWidened)
                 CorrelationSection(activeSeries, range)

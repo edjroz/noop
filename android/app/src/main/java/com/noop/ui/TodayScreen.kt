@@ -55,6 +55,18 @@ fun TodayScreen(viewModel: AppViewModel, onSupport: () -> Unit = {}) {
 
     ScreenScaffold(title = "Control Center", subtitle = "Your day, read in full") {
 
+        // When there is no daily score yet (today's recovery is null / no history),
+        // lead with the "live now, history one import away" note so the empty tiles
+        // below are explained rather than just dashed out.
+        if (today?.recovery == null) {
+            DataPendingNote(
+                title = "Live now. Your history is one import away.",
+                body = "Your live heart rate is working from the strap. To fill recovery, " +
+                    "strain, sleep and trends, import your WHOOP export in Data Sources. " +
+                    "It backfills your full history in about a minute.",
+            )
+        }
+
         if (alert != null) IllnessBanner(alert!!)
 
         // HERO — ring + synthesis read-out, with a subtle always-on support affordance.

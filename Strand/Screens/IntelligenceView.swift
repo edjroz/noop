@@ -27,6 +27,12 @@ struct IntelligenceView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
+            } else if intelligence.results.isEmpty {
+                DataPendingNote(
+                    title: "Building from your strap",
+                    message: "This builds from the strap as it syncs. Strain and sleep appear after you have worn it and slept a night. Recovery needs about a week of nights to learn your baseline, or import your WHOOP export to skip the wait.",
+                    symbol: "brain.head.profile"
+                )
             } else {
                 ForEach(intelligence.results) { day in
                     dayCard(day)

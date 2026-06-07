@@ -144,7 +144,7 @@ struct CompareView: View {
                 metricSection
 
                 if selected.count < minSelection {
-                    ComingSoon(what: "Pick at least two metrics above to overlay them and read how they move together.")
+                    ComingSoon(what: "Compare needs at least two metrics with history. Import your WHOOP export in Data Sources first.")
                 } else {
                     let series = activeSeries
                     if series.allSatisfy({ $0.rows.isEmpty }) {

@@ -33,7 +33,7 @@ struct WorkoutsView: View {
         ScreenScaffold(title: "Workouts", subtitle: "Every session, threaded together.") {
             if allRows.isEmpty {
                 ComingSoon(what: loaded
-                    ? "No sessions yet. Import a Whoop or Apple Health export, or log workouts on the strap."
+                    ? "No workouts yet. They come from your WHOOP and Apple Health history. Import in Data Sources to bring them in."
                     : "Loading your sessions…")
             } else {
                 // Compute the windowed rows and per-sport groups ONCE per body

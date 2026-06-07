@@ -183,16 +183,13 @@ fun InsightsScreen(vm: AppViewModel) {
                 )
             }
         } else if (behaviours.isEmpty()) {
-            // No journal yet — explain, but still surface relationships below.
-            NoopCard {
-                Text(
-                    "No journal answers yet. Log behaviours in your Whoop journal — things " +
-                        "like alcohol, caffeine, late meals or meditation — and Insights will " +
-                        "measure how each one moves your recovery, HRV, sleep and resting heart rate.",
-                    style = NoopType.subhead,
-                    color = Palette.textSecondary,
-                )
-            }
+            // No journal yet — explain what an import unlocks, but still surface
+            // relationships below if the daily cache has them.
+            DataPendingNote(
+                title = "Insights read your journal and outcomes",
+                body = "Insights read your journal and outcomes. Import your WHOOP export, " +
+                    "which includes your journal, in Data Sources to unlock them.",
+            )
         } else {
             BehaviourSection(
                 outcome = outcome,

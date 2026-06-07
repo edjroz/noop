@@ -56,6 +56,8 @@ final class IntelligenceEngine: ObservableObject {
         let maxHR = profile.hrMaxOverride > 0 ? Double(profile.hrMaxOverride) : nil
         let now = Int(Date().timeIntervalSince1970)
         var out: [Computed] = []
+        var dailies: [DailyMetric] = []
+        var cachedSleep: [CachedSleepSession] = []
 
         for offset in 0..<maxDays {
             let dayStart = now - offset * 86_400
@@ -75,11 +77,24 @@ final class IntelligenceEngine: ObservableObject {
             out.append(Computed(day: day, recovery: res.recovery, strain: res.strain,
                                 sleepMin: res.daily.totalSleepMin, hrv: res.daily.avgHrv,
                                 rhr: res.daily.restingHr))
+            dailies.append(res.daily)
+            cachedSleep.append(contentsOf: res.cachedSleep)
         }
+
+        // Persist the computed scores under a dedicated "-noop" source so the WHOLE dashboard
+        // (Today / Recovery / Strain / Sleep / Trends), not just this screen, reads them. The
+        // Repository merges these UNDER any imported "my-whoop" rows, so a real WHOOP import
+        // always wins; this only fills the days the strap collected but no import covered.
+        let computedId = deviceId + "-noop"
+        if !dailies.isEmpty { _ = try? await store.upsertDailyMetrics(dailies, deviceId: computedId) }
+        if !cachedSleep.isEmpty { _ = try? await store.upsertSleepSessions(cachedSleep, deviceId: computedId) }
 
         results = out
         note = out.isEmpty
-            ? "No raw-stream days yet. Wear the strap with NOOP connected overnight and the engine will score your recovery, strain and sleep itself — no WHOOP cloud required."
+            ? "No scored nights yet. Wear the strap with NOOP connected overnight and the engine will score your recovery, strain and sleep itself, no WHOOP cloud required."
             : nil
+
+        // Reload the dashboard caches so the freshly computed scores show up immediately.
+        if !dailies.isEmpty { await repo.refresh() }
     }
 }

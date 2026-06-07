@@ -208,9 +208,9 @@ fun DataSourcesScreen(vm: AppViewModel) {
         SourceCard(
             title = "WHOOP History",
             icon = Icons.Filled.MonitorHeart,
-            subtitle = "Recovery, strain, sleep and workouts synced from your WHOOP strap and " +
-                "stored locally. Importing a full WHOOP data export (.zip) from " +
-                "app.whoop.com → Data Management is on the roadmap for Android.",
+            subtitle = "Recovery, strain, sleep and workouts, stored locally. Import a full " +
+                "WHOOP data export (.zip) from app.whoop.com → Data Management and it " +
+                "backfills your whole history in about a minute. Working now on Android.",
         ) {
             StatePill(
                 title = if (whoopHasHr) "Streaming locally" else "No samples yet",
@@ -233,10 +233,9 @@ fun DataSourcesScreen(vm: AppViewModel) {
         SourceCard(
             title = "Apple Health",
             icon = Icons.Filled.FavoriteBorder,
-            subtitle = "Cached HR, HRV, sleep, SpO₂ and steps imported from an Apple Health " +
-                "export. Producing that export.zip (Health app → Export All Health Data) " +
-                "is an Apple-platform step; on Android this screen shows what has already " +
-                "been brought across.",
+            subtitle = "Import HR, HRV, sleep, SpO₂ and steps from an Apple Health export. On " +
+                "an iPhone: Health app → tap your photo → Export All Health Data, then " +
+                "import the .zip here. Working now on Android.",
         ) {
             val hasApple = (appleDays ?: 0) > 0 || (appleWorkouts ?: 0) > 0
             StatePill(

@@ -66,7 +66,7 @@ fun TrendsScreen(vm: AppViewModel) {
 
     ScreenScaffold(title = "Trends", subtitle = "The thread of you over time.") {
         if (days.isEmpty()) {
-            EmptyTrends(loaded = fullHistory != null)
+            EmptyTrends()
             return@ScreenScaffold
         }
 
@@ -383,31 +383,12 @@ private fun SparsePlaceholder(height: Dp = Metrics.chartHeight) {
 }
 
 @Composable
-private fun EmptyTrends(loaded: Boolean) {
-    NoopCard(padding = 24.dp) {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Overline("Trends")
-            Text(
-                if (loaded) "No history yet" else "Loading your history…",
-                style = NoopType.title2,
-                color = Palette.textPrimary,
-                textAlign = TextAlign.Center,
-            )
-            if (loaded) {
-                Text(
-                    "Wear the strap to start the thread — recovery, HRV, resting heart rate and " +
-                        "day strain will chart here as days accumulate.",
-                    style = NoopType.footnote,
-                    color = Palette.textTertiary,
-                    textAlign = TextAlign.Center,
-                )
-            }
-        }
-    }
+private fun EmptyTrends() {
+    DataPendingNote(
+        title = "Trends need history to draw",
+        body = "Trends need history to draw. Import your WHOOP export in Data Sources " +
+            "to see weeks, months and years instantly.",
+    )
 }
 
 // MARK: - Small numeric helpers
