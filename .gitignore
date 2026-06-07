@@ -68,3 +68,8 @@ export.xml
 export.zip
 *whoop_export*.zip
 *apple_health*.zip
+
+# ── Vendored DefraDB binary (DefraSync experiment) ──────────────
+# 173 MB upstream release — never committed; fetched per-machine via Tools/defradb/fetch.sh.
+# The script + checksum file are committed so both Macs land on the same pinned version.
+Tools/defradb/defradb-darwin-*

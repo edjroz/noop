@@ -2,11 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Sandbox OFF for the DefraDB sync experiment: a sandboxed app can't spawn the defradb
+	     sidecar via Process(). Long-term: switch to a per-user LaunchAgent for a sandboxed release. -->
 	<key>com.apple.security.app-sandbox</key>
-	<true/>
+	<false/>
 	<key>com.apple.security.device.bluetooth</key>
 	<true/>
 	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+	<!-- Reach the localhost sidecar over HTTP. No remote calls. -->
+	<key>com.apple.security.network.client</key>
 	<true/>
 </dict>
 </plist>

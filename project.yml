@@ -30,6 +30,8 @@ packages:
     path: Packages/StrandImport
   StrandDesign:
     path: Packages/StrandDesign
+  DefraSync:
+    path: Packages/DefraSync
 targets:
   Strand:
     type: application
@@ -51,9 +53,14 @@ targets:
     entitlements:
       path: Strand/Resources/Strand.entitlements
       properties:
-        com.apple.security.app-sandbox: true
+        # Sandbox is OFF while the DefraDB sync experiment is in place: a sandboxed app cannot
+        # spawn the defradb sidecar via Process(). For long-term: keep this OFF for dev builds
+        # and switch to a per-user LaunchAgent for a sandboxed release build.
+        com.apple.security.app-sandbox: false
         com.apple.security.device.bluetooth: true
         com.apple.security.files.user-selected.read-write: true
+        # Network client so we can reach the localhost sidecar (no remote calls).
+        com.apple.security.network.client: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.noopapp.noop
@@ -70,6 +77,7 @@ targets:
       - package: StrandAnalytics
       - package: StrandImport
       - package: StrandDesign
+      - package: DefraSync
   StrandTests:
     type: bundle.unit-test
     platform: macOS

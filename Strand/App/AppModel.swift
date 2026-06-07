@@ -26,6 +26,9 @@ final class AppModel: ObservableObject {
     let intelligence: IntelligenceEngine
     /// Opt-in AI coach (bring-your-own-key) — the one networked feature, off until the user enables it.
     let coach: AICoachEngine
+    /// Experimental DefraDB sync layer. Lazily initialized after the store is open; nil while the
+    /// feature is disabled. Listens for `UserDefaults["sync.enabled"]` to come up.
+    @Published var sync: SyncController?
 
     /// Timestamps of moments marked via a double-tap (persisted).
     @Published var moments: [Date] = []
@@ -76,12 +79,37 @@ final class AppModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             await self.repo.refresh()                          // surface any imported data at once
+            await self.bootstrapSyncIfEnabled()
             try? await Task.sleep(nanoseconds: 6_000_000_000)  // give the first offload a moment
             while !Task.isCancelled {
                 await self.intelligence.analyzeRecent()
                 try? await Task.sleep(nanoseconds: 900_000_000_000)  // 15 min, matches the offload cadence
             }
         }
+    }
+
+    /// Wire up the DefraDB sync layer if the user has opted in. Idempotent — re-callable from
+    /// the Sync settings toggle.
+    func bootstrapSyncIfEnabled() async {
+        guard UserDefaults.standard.bool(forKey: "sync.enabled") else { return }
+        guard sync == nil, let store = await repo.storeHandle() else { return }
+        let dir = (try? SyncPaths.defraDataDir()) ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let bin = SyncPaths.defraBinaryURL()
+        let controller = SyncController(
+            store: store,
+            repoRefresh: { [weak self] in await self?.repo.refresh() },
+            dataDir: dir,
+            binaryURL: bin
+        )
+        sync = controller
+        await controller.start()
+    }
+
+    /// Tear down the sync layer (Settings → Disable, or app quit).
+    func teardownSync() async {
+        guard let controller = sync else { return }
+        await controller.stop()
+        sync = nil
     }
 
     /// Fold a fresh reading into the smoothing window and republish a stable bpm.

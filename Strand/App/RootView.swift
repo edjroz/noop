@@ -21,6 +21,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
     case notifications = "Notifications"
     case automation = "Automations"
     case settings = "Settings"
+    case sync = "Sync"
     case support = "Support"
 
     var id: String { rawValue }
@@ -45,6 +46,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .notifications: return "bell.badge.fill"
         case .automation: return "wand.and.stars"
         case .settings: return "gearshape.fill"
+        case .sync: return "arrow.triangle.2.circlepath"
         case .support: return "heart.fill"
         }
     }
@@ -111,6 +113,7 @@ struct RootView: View {
         case .notifications: NotificationSettingsView()
         case .automation: AutomationsView()
         case .settings: SettingsView()
+        case .sync: SyncSettingsView()
         case .support: SupportView()
         }
     }
