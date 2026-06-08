@@ -7,10 +7,17 @@
 #   - my-whoop rows from the local SQLite store (the deviceId MockSeeder now writes
 #     under — the dashboard reads this deviceId, so this is also where any real
 #     WHOOP import would live; only safe to run while the experiment is mock-only).
+#   - the running defradb SIDECAR PROCESS, stopped before the data dir is removed. This
+#     matters: a sidecar (orphaned from a crash/force-quit, or launchd KeepAlive) keeps the
+#     Badger files open, so deleting the dir under a live process does nothing — it keeps
+#     serving the old documents on :9181, and the next sync re-floods SQLite with them.
 #   - the entire DefraDB data dir (collections, p2p identity, replicators).
 #   - UserDefaults for schema-hash and backfill-done flags (binary-path override is kept).
 # Pass --no-build to skip the build reset (data wipe only).
 # Pass --no-open to skip re-launching Xcode.
+#
+# NOTE (two-Mac sync experiment): this only resets THIS machine. If a peer Mac still holds the
+# documents, enabling sync and reconnecting to it re-gossips them back. Run --data on both Macs.
 #
 # This NEVER touches the vendored defradb binary or your source tree.
 
@@ -111,10 +118,52 @@ SQL
         echo "(no whoop.sqlite yet, skipping SQL wipe)"
     fi
 
+    # Stop the sidecar BEFORE deleting its data dir. A live defradb process keeps the Badger
+    # files open (open fds survive unlink), so it would keep serving the old documents on :9181
+    # and the next sync would re-flood SQLite. Order: bootout launchd (else KeepAlive respawns
+    # it), then kill any process bound to OUR rootdir, then verify the dir delete sticks.
+    PLIST="${HOME}/Library/LaunchAgents/com.noopapp.defradb.plist"
+    if [[ -f "${PLIST}" ]]; then
+        echo "→ Booting out launchd-managed defradb sidecar"
+        launchctl bootout "gui/$(id -u)" "${PLIST}" 2>/dev/null || true
+    fi
+
+    SIDECAR_PAT="defradb.* --rootdir ${DEFRA_DIR}"
+    if pgrep -f "${SIDECAR_PAT}" >/dev/null; then
+        echo "→ Stopping defradb sidecar holding the OpenWhoop data dir"
+        # Try graceful first, then SIGKILL. The sidecar ignores SIGTERM (Badger flush can hang),
+        # and we're deleting the data dir anyway, so a clean shutdown buys us nothing.
+        pkill -TERM -f "${SIDECAR_PAT}" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6; do
+            pgrep -f "${SIDECAR_PAT}" >/dev/null || break
+            sleep 0.5
+        done
+        if pgrep -f "${SIDECAR_PAT}" >/dev/null; then
+            echo "  …SIGTERM ignored, sending SIGKILL"
+            pkill -KILL -f "${SIDECAR_PAT}" 2>/dev/null || true
+            for _ in 1 2 3 4; do
+                pgrep -f "${SIDECAR_PAT}" >/dev/null || break
+                sleep 0.5
+            done
+        fi
+        if pgrep -f "${SIDECAR_PAT}" >/dev/null; then
+            echo "  ❌ defradb sidecar refused to die — kill it manually, then re-run." >&2
+            exit 1
+        fi
+    fi
+
     if [[ -d "${DEFRA_DIR}" ]]; then
         echo "→ Removing DefraDB data dir"
         rm -rf "${DEFRA_DIR}"
     fi
+
+    # Read-back: if anything still answers on :9181, a sidecar is alive and the wipe won't stick.
+    if curl -fsS --max-time 2 "http://127.0.0.1:9181/api/v0/health" >/dev/null 2>&1; then
+        echo "  ❌ a defradb sidecar is still up on :9181 — old documents will re-sync." >&2
+        echo "     Find and kill it (pgrep -fl defradb), then re-run with --data." >&2
+        exit 1
+    fi
+    echo "  ✓ DefraDB cleared (no sidecar on :9181)"
 
     echo "→ Clearing schema-hash and backfill-done UserDefaults"
     defaults delete com.noopapp.noop defra.schema.hash 2>/dev/null || true
