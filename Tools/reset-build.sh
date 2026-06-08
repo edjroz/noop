@@ -74,14 +74,39 @@ if [[ "${DO_DATA}" == 1 ]]; then
         # MockSeeder used to write under mock-<hostname-hash>; it now writes under my-whoop so
         # the dashboard actually shows the rows. Wipe both patterns so this script keeps working
         # for anyone on either old or new seeded data.
+        #
+        # The store runs in WAL mode, so deletes land in whoop.sqlite-wal until a checkpoint folds
+        # them into the main file. We TRUNCATE-checkpoint and then remove the -wal/-shm sidecars so
+        # a stale WAL can't make the wipe look like it didn't take. PRAGMAs and the count read-back
+        # are in the same sqlite3 invocation so they observe the post-delete state.
         sqlite3 "${DB}" <<'SQL'
+PRAGMA foreign_keys = ON;
 DELETE FROM dailyMetric  WHERE deviceId = 'my-whoop' OR deviceId LIKE 'mock-%';
 DELETE FROM sleepSession WHERE deviceId = 'my-whoop' OR deviceId LIKE 'mock-%';
 DELETE FROM journal      WHERE deviceId = 'my-whoop' OR deviceId LIKE 'mock-%';
 DELETE FROM workout      WHERE deviceId = 'my-whoop' OR deviceId LIKE 'mock-%';
 DELETE FROM appleDaily   WHERE deviceId = 'my-whoop' OR deviceId LIKE 'mock-%';
 DELETE FROM defra_outbox;
+PRAGMA wal_checkpoint(TRUNCATE);
 SQL
+        rm -f "${DB}-wal" "${DB}-shm"
+
+        # Read-back so an aborted/partial wipe can't masquerade as success.
+        remaining=$(sqlite3 "${DB}" "
+            SELECT COALESCE(SUM(n),0) FROM (
+                SELECT COUNT(*) n FROM dailyMetric  WHERE deviceId='my-whoop' OR deviceId LIKE 'mock-%'
+                UNION ALL SELECT COUNT(*) FROM sleepSession WHERE deviceId='my-whoop' OR deviceId LIKE 'mock-%'
+                UNION ALL SELECT COUNT(*) FROM journal      WHERE deviceId='my-whoop' OR deviceId LIKE 'mock-%'
+                UNION ALL SELECT COUNT(*) FROM workout      WHERE deviceId='my-whoop' OR deviceId LIKE 'mock-%'
+                UNION ALL SELECT COUNT(*) FROM appleDaily   WHERE deviceId='my-whoop' OR deviceId LIKE 'mock-%'
+                UNION ALL SELECT COUNT(*) FROM defra_outbox
+            );")
+        if [[ "${remaining}" == "0" ]]; then
+            echo "  ✓ SQLite store cleared (0 mock rows remain)"
+        else
+            echo "  ❌ ${remaining} mock rows still present after wipe — is the app holding the DB?" >&2
+            exit 1
+        fi
     else
         echo "(no whoop.sqlite yet, skipping SQL wipe)"
     fi
