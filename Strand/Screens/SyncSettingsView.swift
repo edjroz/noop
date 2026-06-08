@@ -141,35 +141,42 @@ struct SyncSettingsView: View {
                     .font(StrandFont.footnote)
                     .foregroundStyle(StrandPalette.textTertiary)
             }
-            Text("Paste this address into the \"Add peer\" field on your other Mac.")
+            Text("Paste this address into the \"Connect to peer\" field on your other Mac. Only one side needs to dial — pubsub is symmetric once libp2p connects.")
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textSecondary)
         }
     }
 
-    // MARK: - Peers
+    // MARK: - Connect to peer
 
     private var peersCard: some View {
-        SyncSection(icon: "rectangle.connected.to.line.below", title: "Peers") {
-            ForEach(model.sync?.peers ?? [], id: \.self) { peer in
+        SyncSection(icon: "rectangle.connected.to.line.below", title: "Connect to peer") {
+            HStack {
+                TextField("Paste peer multiaddr", text: $peerInput)
+                    .textFieldStyle(.roundedBorder)
+                Button("Connect") { addPeer() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(StrandPalette.accent)
+                    .disabled(peerInput.isEmpty || working)
+            }
+            let active = model.sync?.peers ?? []
+            HStack {
+                Image(systemName: active.isEmpty ? "circle" : "circle.fill")
+                    .foregroundStyle(active.isEmpty ? StrandPalette.statusWarning : StrandPalette.statusPositive)
+                    .font(.system(size: 8))
+                Text("Active peers: \(active.count)")
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textSecondary)
+            }
+            ForEach(active, id: \.self) { peer in
                 Text(peer)
                     .font(StrandFont.mono(11))
                     .foregroundStyle(StrandPalette.textPrimary)
                     .textSelection(.enabled)
             }
-            if (model.sync?.peers ?? []).isEmpty {
-                Text("No peers yet.")
-                    .font(StrandFont.footnote)
-                    .foregroundStyle(StrandPalette.textTertiary)
-            }
-            HStack {
-                TextField("Paste peer multiaddr", text: $peerInput)
-                    .textFieldStyle(.roundedBorder)
-                Button("Add peer") { addPeer() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(StrandPalette.accent)
-                    .disabled(peerInput.isEmpty || working)
-            }
+            Text("If the count stays at 0 after connecting, allow defradb through System Settings → Network → Firewall on the dialed Mac, or briefly turn the firewall off to test.")
+                .font(StrandFont.footnote)
+                .foregroundStyle(StrandPalette.textTertiary)
             statsRow
         }
     }
@@ -201,7 +208,7 @@ struct SyncSettingsView: View {
 
     private var mockCard: some View {
         SyncSection(icon: "flask", title: "Mock data") {
-            Text("No real WHOOP yet? Seed plausible rows under a per-Mac deviceId so you can watch them propagate to the other machine.")
+            Text("No real WHOOP yet? Seed plausible rows under the dashboard's deviceId so Today / Trends / Sleep populate immediately, and any other Mac you've connected receives them.")
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textSecondary)
             HStack {
@@ -218,7 +225,7 @@ struct SyncSettingsView: View {
                 .buttonStyle(.bordered)
                 .disabled(working)
             }
-            Text("Mock deviceId: \(MockSeeder.defaultDeviceId())")
+            Text("Mock deviceId: \(MockSeeder.defaultDeviceId()) (each Mac stamps lastWriterPeer in DefraDB so you can still tell who wrote what)")
                 .font(StrandFont.mono(11))
                 .foregroundStyle(StrandPalette.textTertiary)
         }

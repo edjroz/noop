@@ -116,14 +116,11 @@ public enum MockSeeder {
         await seed(into: store, settings: Settings(deviceId: deviceId, nDays: 1))
     }
 
-    /// Default deviceId for the seeder, derived from the machine name so desktop and laptop pick
-    /// different IDs by default.
-    public static func defaultDeviceId() -> String {
-        let host = Host.current().localizedName ?? ""
-        // Stable, sortable, and a different machine produces a different id.
-        let suffix = host.unicodeScalars.reduce(into: 0 as UInt32) { $0 = $0 &* 31 &+ $1.value }
-        return "mock-\(String(suffix, radix: 16))"
-    }
+    /// Default deviceId for the seeder. Writes under `my-whoop` — the same deviceId the dashboard
+    /// (`Strand/Data/Repository.swift`) queries — so the seeded rows actually show up on Today /
+    /// Trends / Sleep / Workouts. Per-Mac provenance is preserved in DefraDB's `lastWriterPeer`
+    /// field, which DefraSyncer stamps on every published row.
+    public static func defaultDeviceId() -> String { "my-whoop" }
 }
 
 // MARK: - Deterministic seeded PRNG keyed by (deviceId, day)

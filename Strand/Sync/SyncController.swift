@@ -86,9 +86,21 @@ public final class SyncController: ObservableObject {
             }
         }
 
+        // Subscribe this node to every collection's pubsub topic. Once both Macs are subscribed
+        // and one dials the other via `p2p connect`, writes fan out symmetrically. Idempotent.
+        do {
+            try await DefraP2P.subscribeCollections(
+                binaryURL: sidecar.binaryURL,
+                names: DefraTypeName.allCollections.compactMap(DefraTypeName.graphqlType(for:))
+            )
+        } catch {
+            phase = .sidecarFailed("p2p collection add: \(error)")
+            return
+        }
+
         // Refresh peer state.
         myMultiaddr = try? await client.selfMultiaddr()
-        peers = (try? await client.listPeers()) ?? []
+        peers = (try? await client.activePeers()) ?? []
 
         // Wire observer + subscriber.
         let syncer = DefraSyncer(client: client, store: store, nodeLabel: _nodeLabel)
@@ -131,16 +143,17 @@ public final class SyncController: ObservableObject {
 
     // MARK: - User actions surfaced in Settings
 
+    /// Dial the given peer over libp2p. Once connected, pubsub auto-routes both directions for
+    /// the topics this node has subscribed to in `start()`. Only one Mac needs to dial; the
+    /// other side accepts the connection.
     public func addPeer(_ multiaddr: String) async throws {
-        try await client.addPeer(multiaddr, schemas: DefraTypeName.allCollections.map {
-            DefraTypeName.graphqlType(for: $0) ?? $0
-        })
-        peers = (try? await client.listPeers()) ?? peers
+        try await DefraP2P.connect(binaryURL: sidecar.binaryURL, multiaddr: multiaddr)
+        peers = (try? await client.activePeers()) ?? peers
     }
 
     public func refreshSnapshot() async {
         myMultiaddr = try? await client.selfMultiaddr()
-        peers = (try? await client.listPeers()) ?? peers
+        peers = (try? await client.activePeers()) ?? peers
         await refreshCounts()
     }
 

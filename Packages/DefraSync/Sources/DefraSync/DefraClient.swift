@@ -116,36 +116,21 @@ public actor DefraClient {
         throw DefraError.decoding("p2p/info shape unknown")
     }
 
-    /// POST /api/v0/p2p/replicators with the peer's multiaddr.
-    public func addPeer(_ multiaddr: String, schemas: [String]) async throws {
-        var req = URLRequest(url: baseURL.appendingPathComponent("api/v0/p2p/replicators"))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: Any] = ["addr": multiaddr, "schemas": schemas]
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await session.data(for: req)
-        guard let http = resp as? HTTPURLResponse else { throw DefraError.sidecarUnreachable }
-        guard (200..<300).contains(http.statusCode) else {
-            throw DefraError.http(status: http.statusCode,
-                                  body: String(data: data, encoding: .utf8) ?? "")
-        }
-    }
-
-    /// GET /api/v0/p2p/replicators → list of currently-configured replicators (peers).
-    public func listPeers() async throws -> [String] {
-        var req = URLRequest(url: baseURL.appendingPathComponent("api/v0/p2p/replicators"))
+    /// GET /api/v0/p2p/active-peers → list of currently libp2p-connected peer descriptors.
+    /// Each entry is a short identifier or a multiaddr depending on the alpha build; we accept
+    /// either flat-string arrays or arrays of `{ ID: "..." }` objects.
+    public func activePeers() async throws -> [String] {
+        var req = URLRequest(url: baseURL.appendingPathComponent("api/v0/p2p/active-peers"))
         req.httpMethod = "GET"
         let (data, resp) = try await session.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw DefraError.sidecarUnreachable
         }
-        guard let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            return []
+        let parsed = try? JSONSerialization.jsonObject(with: data)
+        if let arr = parsed as? [String] { return arr }
+        if let arr = parsed as? [[String: Any]] {
+            return arr.compactMap { ($0["ID"] as? String) ?? ($0["addr"] as? String) }
         }
-        return arr.compactMap { rep in
-            // Tolerate two response shapes the alpha has shipped over time.
-            if let info = rep["Info"] as? [String: Any], let id = info["ID"] as? String { return id }
-            return rep["addr"] as? String
-        }
+        return []
     }
 }
