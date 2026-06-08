@@ -18,11 +18,15 @@ public enum MockSeeder {
         }
     }
 
-    /// Generate `nDays` of synthetic rows ending today and upsert them. Deterministic per
-    /// (deviceId, day) — re-running is idempotent, the natural-key upserts overwrite in place.
-    public static func seed(into store: WhoopStore, settings: Settings) async {
+    /// Generate `nDays` of synthetic rows ending on `endingOn` (default: today) and upsert them.
+    /// Deterministic per `(deviceId, day)` — re-running is idempotent, the natural-key upserts
+    /// overwrite in place. To grow the history backward across presses, set `endingOn` to the
+    /// day before the earliest existing row (see `extendHistory`).
+    public static func seed(into store: WhoopStore,
+                            settings: Settings,
+                            endingOn: Date? = nil) async {
         let cal = Calendar.current
-        let today = cal.startOfDay(for: Date())
+        let endDay = cal.startOfDay(for: endingOn ?? Date())
         var days: [DailyMetric] = []
         var sleeps: [CachedSleepSession] = []
         var journal: [JournalEntry] = []
@@ -34,7 +38,7 @@ public enum MockSeeder {
         df.dateFormat = "yyyy-MM-dd"
 
         for back in (0..<settings.nDays).reversed() {
-            guard let day = cal.date(byAdding: .day, value: -back, to: today) else { continue }
+            guard let day = cal.date(byAdding: .day, value: -back, to: endDay) else { continue }
             let dayStr = df.string(from: day)
             var r = seededRand(deviceId: settings.deviceId, day: dayStr)
             // Stable plausible numbers from the per-row hash.
@@ -114,6 +118,37 @@ public enum MockSeeder {
     /// live-watch propagation to the other Mac.
     public static func addOneDay(into store: WhoopStore, deviceId: String) async {
         await seed(into: store, settings: Settings(deviceId: deviceId, nDays: 1))
+    }
+
+    /// Extend the synthetic history `days` days further into the past. Each press of "Add 60
+    /// older days" walks the existing earliest day back by 60. This is what makes the seeder
+    /// actually *grow* the dataset across presses, instead of overwriting the same window.
+    /// Returns the number of new days added (0 if the seeder failed to find an anchor).
+    @discardableResult
+    public static func extendHistory(into store: WhoopStore, deviceId: String, days: Int = 60) async -> Int {
+        let earliestExistingDay: String?
+        do {
+            let rows = try await store.dailyMetrics(deviceId: deviceId, from: "1990-01-01", to: "2099-01-01")
+            earliestExistingDay = rows.first?.day
+        } catch {
+            earliestExistingDay = nil
+        }
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "yyyy-MM-dd"
+        let cal = Calendar.current
+        let anchor: Date
+        if let s = earliestExistingDay, let d = df.date(from: s) {
+            // Seed up to the day BEFORE the earliest existing row.
+            anchor = cal.date(byAdding: .day, value: -1, to: d) ?? d
+        } else {
+            // No existing rows — seed ending today, same as a fresh seed.
+            anchor = Date()
+        }
+        await seed(into: store,
+                   settings: Settings(deviceId: deviceId, nDays: days),
+                   endingOn: anchor)
+        return days
     }
 
     /// Default deviceId for the seeder. Writes under `my-whoop` — the same deviceId the dashboard

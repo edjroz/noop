@@ -212,18 +212,27 @@ struct SyncSettingsView: View {
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textSecondary)
             HStack {
-                Button("Seed 60 days") {
+                Button("Re-seed last 60 days") {
                     Task { await runSeeder(days: 60) }
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(StrandPalette.accent)
                 .disabled(working)
+                .help("Idempotent — overwrites the most recent 60 days. Use when starting fresh.")
 
-                Button("Add 1 day") {
+                Button("Add 60 older days") {
+                    Task { await runExtendHistory() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(working)
+                .help("Walks the earliest existing day 60 further into the past. Press repeatedly to grow trend history.")
+
+                Button("Add today") {
                     Task { await runSeeder(days: 1) }
                 }
                 .buttonStyle(.bordered)
                 .disabled(working)
+                .help("Overwrites today's row — handy for watching propagation to the other Mac.")
             }
             Text("Mock deviceId: \(MockSeeder.defaultDeviceId()) (each Mac stamps lastWriterPeer in DefraDB so you can still tell who wrote what)")
                 .font(StrandFont.mono(11))
@@ -305,6 +314,20 @@ struct SyncSettingsView: View {
             await MockSeeder.seed(into: store, settings: .init(deviceId: deviceId, nDays: days))
             await model.repo.refresh()
             statusMessage = "Seeded \(days) day\(days == 1 ? "" : "s") under \(deviceId)."
+        } else {
+            statusMessage = "Couldn't open the store."
+        }
+        working = false
+    }
+
+    private func runExtendHistory() async {
+        working = true
+        statusMessage = "Extending history…"
+        let deviceId = MockSeeder.defaultDeviceId()
+        if let store = await model.repo.storeHandle() {
+            let added = await MockSeeder.extendHistory(into: store, deviceId: deviceId, days: 60)
+            await model.repo.refresh()
+            statusMessage = "Added \(added) older days under \(deviceId)."
         } else {
             statusMessage = "Couldn't open the store."
         }
