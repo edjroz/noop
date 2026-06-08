@@ -4,9 +4,11 @@
 # branch switch.
 #
 # Build reset only by default. Pass --data to ALSO wipe app state:
-#   - mock-* rows from the local SQLite store (leaves real imports/strap data intact)
-#   - the entire DefraDB data dir (collections, p2p identity, replicators)
-#   - UserDefaults for schema-hash and backfill-done flags
+#   - my-whoop rows from the local SQLite store (the deviceId MockSeeder now writes
+#     under — the dashboard reads this deviceId, so this is also where any real
+#     WHOOP import would live; only safe to run while the experiment is mock-only).
+#   - the entire DefraDB data dir (collections, p2p identity, replicators).
+#   - UserDefaults for schema-hash and backfill-done flags (binary-path override is kept).
 # Pass --no-build to skip the build reset (data wipe only).
 # Pass --no-open to skip re-launching Xcode.
 #
@@ -68,13 +70,16 @@ if [[ "${DO_DATA}" == 1 ]]; then
     DEFRA_DIR="${HOME}/Library/Application Support/OpenWhoop/defra"
 
     if [[ -f "${DB}" ]]; then
-        echo "→ Deleting mock-* rows from local SQLite store"
+        echo "→ Deleting my-whoop / mock-* rows from local SQLite store"
+        # MockSeeder used to write under mock-<hostname-hash>; it now writes under my-whoop so
+        # the dashboard actually shows the rows. Wipe both patterns so this script keeps working
+        # for anyone on either old or new seeded data.
         sqlite3 "${DB}" <<'SQL'
-DELETE FROM dailyMetric  WHERE deviceId LIKE 'mock-%';
-DELETE FROM sleepSession WHERE deviceId LIKE 'mock-%';
-DELETE FROM journal      WHERE deviceId LIKE 'mock-%';
-DELETE FROM workout      WHERE deviceId LIKE 'mock-%';
-DELETE FROM appleDaily   WHERE deviceId LIKE 'mock-%';
+DELETE FROM dailyMetric  WHERE deviceId = 'my-whoop' OR deviceId LIKE 'mock-%';
+DELETE FROM sleepSession WHERE deviceId = 'my-whoop' OR deviceId LIKE 'mock-%';
+DELETE FROM journal      WHERE deviceId = 'my-whoop' OR deviceId LIKE 'mock-%';
+DELETE FROM workout      WHERE deviceId = 'my-whoop' OR deviceId LIKE 'mock-%';
+DELETE FROM appleDaily   WHERE deviceId = 'my-whoop' OR deviceId LIKE 'mock-%';
 DELETE FROM defra_outbox;
 SQL
     else
