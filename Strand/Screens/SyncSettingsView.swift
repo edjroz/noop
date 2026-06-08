@@ -141,7 +141,7 @@ struct SyncSettingsView: View {
                     .font(StrandFont.footnote)
                     .foregroundStyle(StrandPalette.textTertiary)
             }
-            Text("Paste this address into the \"Connect to peer\" field on your other Mac. Only one side needs to dial — pubsub is symmetric once libp2p connects.")
+            Text("Paste this address into the \"Connect to peer\" field on your other Mac. For full two-way sync, do this on BOTH Macs with each other's address — DefraDB v1.0.0-rc1 replicates only in the direction of the configured push.")
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textSecondary)
         }
@@ -174,7 +174,7 @@ struct SyncSettingsView: View {
                     .foregroundStyle(StrandPalette.textPrimary)
                     .textSelection(.enabled)
             }
-            Text("If the count stays at 0 after connecting, allow defradb through System Settings → Network → Firewall on the dialed Mac, or briefly turn the firewall off to test.")
+            Text("Connect registers a forward-push replicator on this Mac for the peer. For two-way sync, also run Connect on the other Mac with this one's multiaddr. If active peers stays at 0, allow defradb through System Settings → Network → Firewall on the dialed Mac.")
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textTertiary)
             statsRow

@@ -2,15 +2,19 @@
 # Watch defradb row counts climb on this Mac. Use after `sync-replicate-to.sh` was run on
 # the master Mac. Reports per-collection counts + active-peer list every 3s.
 #
-# Exits when row counts stop changing for 3 consecutive cycles, or after the timeout.
+# Exit condition is "no growth for STABLE_S seconds in a row" — defaults to 60s, because
+# v1.0.0-rc1's replicator throughput can be glacial (sometimes one doc per ~20s) and a
+# shorter window made us think sync had stopped when it was just slow. Adjust if needed.
 #
 # Usage:
-#   ./Tools/sync-watch.sh            # 60s default
-#   ./Tools/sync-watch.sh 180        # custom timeout in seconds
+#   ./Tools/sync-watch.sh                    # 5 min timeout, 60s stable window
+#   ./Tools/sync-watch.sh 900                # 15 min timeout, 60s stable window
+#   ./Tools/sync-watch.sh 900 30             # 15 min timeout, 30s stable window
 
 set -uo pipefail
 
-TIMEOUT_S="${1:-60}"
+TIMEOUT_S="${1:-300}"
+STABLE_S="${2:-60}"
 PORT="${DEFRA_PORT:-9181}"
 URL="http://127.0.0.1:${PORT}"
 COLLECTIONS=(SleepSession DailyMetric Journal Workout AppleDaily)
@@ -27,9 +31,9 @@ count_for() {
 
 STARTED=$(date +%s)
 PREV_SIG=""
-STABLE=0
+LAST_CHANGE_AT=$(date +%s)
 
-echo "Watching for up to ${TIMEOUT_S}s. Exits when counts hold steady for 3 cycles."
+echo "Watching for up to ${TIMEOUT_S}s. Exits when counts don't grow for ${STABLE_S}s in a row."
 echo
 
 while :; do
@@ -49,19 +53,17 @@ while :; do
         LINE+="${T}=${N:-?} "
     done
     PEERS=$(curl -s "${URL}/api/v0/p2p/active-peers" | jq -c)
-    printf "[%s] %s peers=%s\n" "$TIME_FMT" "$LINE" "$PEERS"
+    SINCE_CHANGE=$((NOW - LAST_CHANGE_AT))
+    printf "[%s] %s peers=%s  idle=%ss\n" "$TIME_FMT" "$LINE" "$PEERS" "$SINCE_CHANGE"
 
-    if [[ "$SIG" == "$PREV_SIG" ]]; then
-        STABLE=$(( STABLE + 1 ))
-        if (( STABLE >= 3 )); then
-            echo
-            echo "✓ counts stable for 3 cycles — sync settled"
-            break
-        fi
-    else
-        STABLE=0
+    if [[ "$SIG" != "$PREV_SIG" ]]; then
+        LAST_CHANGE_AT=$NOW
+        PREV_SIG="$SIG"
+    elif (( SINCE_CHANGE >= STABLE_S )); then
+        echo
+        echo "✓ no row growth for ${STABLE_S}s — calling sync settled"
+        break
     fi
-    PREV_SIG="$SIG"
     sleep 3
 done
 

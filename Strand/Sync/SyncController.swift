@@ -143,11 +143,20 @@ public final class SyncController: ObservableObject {
 
     // MARK: - User actions surfaced in Settings
 
-    /// Dial the given peer over libp2p. Once connected, pubsub auto-routes both directions for
-    /// the topics this node has subscribed to in `start()`. Only one Mac needs to dial; the
-    /// other side accepts the connection.
+    /// Wire up two-way sync with the given peer.
+    ///
+    /// In v1.0.0-rc1, `p2p connect` establishes the libp2p link and pubsub routes future writes,
+    /// but it doesn't backfill existing state — proven empirically by running `replicator add`
+    /// from the CLI and watching ~60 docs flow across an otherwise-idle connection. So we also
+    /// register a forward-push replicator: defradb pushes every doc the local node holds (and
+    /// every subsequent write) to the peer. For symmetric sync, both Macs add each other.
     public func addPeer(_ multiaddr: String) async throws {
-        try await DefraP2P.connect(binaryURL: sidecar.binaryURL, multiaddr: multiaddr)
+        let collectionNames = DefraTypeName.allCollections.compactMap(DefraTypeName.graphqlType(for:))
+        try await DefraP2P.replicate(
+            binaryURL: sidecar.binaryURL,
+            collectionNames: collectionNames,
+            multiaddr: multiaddr
+        )
         peers = (try? await client.activePeers()) ?? peers
     }
 
