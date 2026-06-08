@@ -28,7 +28,6 @@ public final class DefraSidecar {
     public let dataDir: URL
     public let httpPort: Int
     public let p2pPort: Int
-    public let enableMDNS: Bool
     public private(set) var ownsProcess = false
     private var process: Process?
     private let client: DefraClient
@@ -36,13 +35,11 @@ public final class DefraSidecar {
     public init(binaryURL: URL,
                 dataDir: URL,
                 httpPort: Int = 9181,
-                p2pPort: Int = 9171,
-                enableMDNS: Bool = false) {
+                p2pPort: Int = 9171) {
         self.binaryURL = binaryURL
         self.dataDir = dataDir
         self.httpPort = httpPort
         self.p2pPort = p2pPort
-        self.enableMDNS = enableMDNS
         self.client = DefraClient(baseURL: URL(string: "http://127.0.0.1:\(httpPort)")!)
     }
 
@@ -72,15 +69,19 @@ public final class DefraSidecar {
 
         let p = Process()
         p.executableURL = binaryURL
-        var args = [
+        // v1.0.0-rc1 verified flag list. `--enable-mdns` does NOT exist (we tried it, sidecar
+        // errored "unknown flag"). `--no-keyring` is REQUIRED on first run or the sidecar
+        // refuses to start with a keyring secret error. Trade-off: --no-keyring means the
+        // libp2p identity is ephemeral per launch, so the peer multiaddr the other Mac saved
+        // becomes stale on restart — user re-adds it.
+        p.arguments = [
             "start",
             "--rootdir", dataDir.path,
             "--url", "127.0.0.1:\(httpPort)",
-            "--p2p-addr", "/ip4/0.0.0.0/tcp/\(p2pPort)",
+            "--p2paddr", "/ip4/0.0.0.0/tcp/\(p2pPort)",
+            "--development",
             "--no-keyring",
         ]
-        if enableMDNS { args.append("--enable-mdns") }
-        p.arguments = args
 
         let logURL = dataDir.appendingPathComponent("defradb.log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
@@ -145,7 +146,8 @@ public final class DefraSidecar {
                 <string>start</string>
                 <string>--rootdir</string><string>\(dataDir.path)</string>
                 <string>--url</string><string>127.0.0.1:\(httpPort)</string>
-                <string>--p2p-addr</string><string>/ip4/0.0.0.0/tcp/\(p2pPort)</string>
+                <string>--p2paddr</string><string>/ip4/0.0.0.0/tcp/\(p2pPort)</string>
+                <string>--development</string>
                 <string>--no-keyring</string>
             </array>
             <key>RunAtLoad</key><true/>

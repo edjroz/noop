@@ -48,41 +48,25 @@ public actor DefraSyncer: WhoopStoreObserver {
         }
     }
 
-    /// One round-trip: query existing _docID by naturalKey → create or update. The query+mutation
-    /// could be batched, but at 5–30 rows/day per collection it's a non-issue.
+    /// Single-round-trip upsert via DefraDB's `upsert_<Type>` mutation introduced in v1.0.0-rc1.
+    /// Atomic: defradb decides "create vs update" server-side using the `filter`. We always pass
+    /// the same row for both `add` and `update` so the result is identical either way.
     private func publish(type: String, naturalKey: String, payload: [String: Any]) async throws {
-        let existing = try await lookupDocID(type: type, naturalKey: naturalKey)
         var stamped = payload
         stamped["naturalKey"] = naturalKey
         stamped["lastWriterPeer"] = nodeLabel
         stamped["lastWriterTs"] = Int(Date().timeIntervalSince1970)
-
-        if let docID = existing {
-            try await mutate(update: type, docID: docID, payload: stamped)
-        } else {
-            try await mutate(create: type, payload: stamped)
+        let payloadGQL = Self.graphqlLiteral(stamped)
+        let keyGQL = Self.graphqlLiteral(naturalKey)
+        let m = """
+        mutation {
+          upsert_\(type)(
+            filter: {naturalKey: {_eq: \(keyGQL)}},
+            add: \(payloadGQL),
+            update: \(payloadGQL)
+          ) { _docID }
         }
-    }
-
-    private func lookupDocID(type: String, naturalKey: String) async throws -> String? {
-        let q = "query($k: String) { \(type)(filter: {naturalKey: {_eq: $k}}) { _docID } }"
-        guard let data = try await client.graphql(q, variables: ["k": naturalKey]) as? [String: Any],
-              let arr = data[type] as? [[String: Any]],
-              let first = arr.first
-        else { return nil }
-        return first["_docID"] as? String
-    }
-
-    private func mutate(create type: String, payload: [String: Any]) async throws {
-        let payloadStr = jsonString(payload) ?? "{}"
-        // DefraDB mutation: create_<Type>(input: {...}).
-        let m = "mutation { create_\(type)(input: \(toGraphQLObject(payloadStr))) { _docID } }"
-        _ = try await client.graphql(m)
-    }
-
-    private func mutate(update type: String, docID: String, payload: [String: Any]) async throws {
-        let payloadStr = jsonString(payload) ?? "{}"
-        let m = "mutation { update_\(type)(docID: \"\(docID)\", input: \(toGraphQLObject(payloadStr))) { _docID } }"
+        """
         _ = try await client.graphql(m)
     }
 
@@ -138,14 +122,42 @@ public actor DefraSyncer: WhoopStoreObserver {
         return obj
     }
 
-    private func jsonString(_ obj: [String: Any]) -> String? {
-        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
-        else { return nil }
-        return String(data: data, encoding: .utf8)
+    /// Serialize a value as a GraphQL literal. GraphQL object syntax overlaps with JSON
+    /// (scalars + arrays) but **object keys are unquoted** (`{key: value}`, not `{"key": value}`).
+    /// We can't reuse JSONSerialization directly because of that one difference.
+    private static func graphqlLiteral(_ value: Any) -> String {
+        switch value {
+        case _ as NSNull:
+            return "null"
+        case let s as String:
+            return "\"\(escape(s))\""
+        case let n as NSNumber:
+            // NSNumber covers Int, Double, Float, Bool. Need to distinguish Bool because
+            // its objCType is "c" while numbers are "i", "q", "d", etc.
+            if CFNumberGetType(n) == .charType || CFGetTypeID(n) == CFBooleanGetTypeID() {
+                return n.boolValue ? "true" : "false"
+            }
+            return n.stringValue
+        case let arr as [Any]:
+            return "[\(arr.map(graphqlLiteral).joined(separator: ", "))]"
+        case let dict as [String: Any]:
+            let pairs = dict.keys.sorted().map { k -> String in
+                "\(k): \(graphqlLiteral(dict[k]!))"
+            }
+            return "{\(pairs.joined(separator: ", "))}"
+        case let opt as Any?:
+            if let v = opt { return graphqlLiteral(v) }
+            return "null"
+        default:
+            return "null"
+        }
     }
 
-    /// DefraDB's `input` argument accepts a JSON-shaped GraphQL object literal. We already have
-    /// a JSON string — pass it through verbatim (it parses as a GraphQL value because DefraDB's
-    /// scalar literals match JSON's syntax).
-    private func toGraphQLObject(_ jsonString: String) -> String { jsonString }
+    private static func escape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+         .replacingOccurrences(of: "\"", with: "\\\"")
+         .replacingOccurrences(of: "\n", with: "\\n")
+         .replacingOccurrences(of: "\r", with: "\\r")
+         .replacingOccurrences(of: "\t", with: "\\t")
+    }
 }

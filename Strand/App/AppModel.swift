@@ -29,6 +29,10 @@ final class AppModel: ObservableObject {
     /// Experimental DefraDB sync layer. Lazily initialized after the store is open; nil while the
     /// feature is disabled. Listens for `UserDefaults["sync.enabled"]` to come up.
     @Published var sync: SyncController?
+    /// Subscription that forwards the SyncController's @Published changes up to AppModel's
+    /// objectWillChange so views observing AppModel (like SyncSettingsView) re-render when nested
+    /// state moves. Without this, the Sync panel sees a stale phase pill forever.
+    private var syncCancellable: AnyCancellable?
 
     /// Timestamps of moments marked via a double-tap (persisted).
     @Published var moments: [Date] = []
@@ -101,6 +105,12 @@ final class AppModel: ObservableObject {
             dataDir: dir,
             binaryURL: bin
         )
+        // Forward the controller's @Published changes up to this AppModel so SyncSettingsView,
+        // which observes AppModel via @EnvironmentObject, re-renders on phase / peer / outbox
+        // updates. Without this the panel reads `model.sync?.phase` once and goes stale.
+        syncCancellable = controller.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         sync = controller
         await controller.start()
     }
@@ -109,6 +119,8 @@ final class AppModel: ObservableObject {
     func teardownSync() async {
         guard let controller = sync else { return }
         await controller.stop()
+        syncCancellable?.cancel()
+        syncCancellable = nil
         sync = nil
     }
 

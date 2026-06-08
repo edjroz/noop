@@ -12,7 +12,6 @@ public enum DefraError: Error, Equatable {
     case http(status: Int, body: String)    // sidecar returned a non-2xx
     case graphqlError(String)               // GraphQL "errors": [...] in the response
     case decoding(String)                   // response didn't match the expected shape
-    case schemaRejected(String)             // schema bootstrap returned an alpha-specific error
 }
 
 public actor DefraClient {
@@ -28,35 +27,23 @@ public actor DefraClient {
         self.session = URLSession(configuration: cfg)
     }
 
-    // MARK: - Health & schema
+    // MARK: - Health
 
-    /// GET /api/v0/health → returns `true` on 200.
+    /// v1.0.0-rc1 doesn't expose `/api/v0/health` — that path 404s. We probe `/api/v0/graphql`
+    /// directly: any HTTP response (even a GraphQL-level error like "collection not found",
+    /// which is what defradb returns on a fresh data dir with no schemas) proves the sidecar is
+    /// up. Only a transport-level failure (connection refused) means it isn't.
     public func health() async -> Bool {
-        var req = URLRequest(url: baseURL.appendingPathComponent("api/v0/health"))
-        req.httpMethod = "GET"
+        var req = URLRequest(url: baseURL.appendingPathComponent("api/v0/graphql"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data(#"{"query":"{ __typename }"}"#.utf8)
         do {
             let (_, resp) = try await session.data(for: req)
-            return (resp as? HTTPURLResponse)?.statusCode == 200
+            return (resp as? HTTPURLResponse) != nil
         } catch {
             return false
         }
-    }
-
-    /// POST /api/v0/schema with the SDL string. DefraDB returns 200 on success, 4xx on
-    /// "schema already exists at this hash" (alpha treats this as an error, not idempotent) —
-    /// we map both to success since we cache the hash in UserDefaults already.
-    public func loadSchema(_ sdl: String) async throws {
-        var req = URLRequest(url: baseURL.appendingPathComponent("api/v0/schema"))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = Data(sdl.utf8)
-        let (data, resp) = try await session.data(for: req)
-        guard let http = resp as? HTTPURLResponse else { throw DefraError.sidecarUnreachable }
-        if (200..<300).contains(http.statusCode) { return }
-        // 400 from DefraDB alpha when types already exist — surface as success.
-        let body = String(data: data, encoding: .utf8) ?? ""
-        if body.lowercased().contains("already exists") { return }
-        throw DefraError.schemaRejected(body)
     }
 
     // MARK: - GraphQL query / mutation
@@ -96,8 +83,9 @@ public actor DefraClient {
 
     // MARK: - P2P management
 
-    /// GET /api/v0/p2p/info — returns this node's full libp2p multiaddr (used in Settings to
-    /// show "this node's peer address" for the user to paste on the other Mac).
+    /// GET /api/v0/p2p/info — returns this node's full libp2p multiaddrs. In v1.0.0-rc1 the
+    /// response is a JSON array of full multiaddrs like `["/ip4/.../tcp/.../p2p/12D3KooW..."]`.
+    /// Older alpha shapes (object with `PeerInfo`, single string) are kept as fallbacks.
     public func selfMultiaddr() async throws -> String {
         var req = URLRequest(url: baseURL.appendingPathComponent("api/v0/p2p/info"))
         req.httpMethod = "GET"
@@ -105,21 +93,26 @@ public actor DefraClient {
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw DefraError.sidecarUnreachable
         }
-        // DefraDB alpha returns either {"PeerInfo": {"Addrs": ["/ip4/..."], "ID": "12D3..."}}
-        // or a flat string. Be lenient.
+        let parsed = try? JSONSerialization.jsonObject(with: data)
+
+        // v1.0.0-rc1: array of multiaddrs. Pick a non-localhost one if possible so the other Mac
+        // can dial it; fall back to the first.
+        if let arr = parsed as? [String], !arr.isEmpty {
+            return arr.first(where: { !$0.contains("/127.0.0.1/") && !$0.contains("/::1/") }) ?? arr[0]
+        }
+        // Older shapes the alpha shipped at various points.
+        if let dict = parsed as? [String: Any] {
+            if let info = dict["PeerInfo"] as? [String: Any],
+               let addrs = info["Addrs"] as? [String],
+               let id = info["ID"] as? String,
+               let first = addrs.first {
+                return "\(first)/p2p/\(id)"
+            }
+            if let addr = dict["multiaddr"] as? String { return addr }
+        }
         if let s = String(data: data, encoding: .utf8), s.hasPrefix("\"") {
             return s.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
         }
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw DefraError.decoding("p2p/info non-object")
-        }
-        if let info = json["PeerInfo"] as? [String: Any],
-           let addrs = info["Addrs"] as? [String],
-           let id = info["ID"] as? String,
-           let first = addrs.first {
-            return "\(first)/p2p/\(id)"
-        }
-        if let addr = json["multiaddr"] as? String { return addr }
         throw DefraError.decoding("p2p/info shape unknown")
     }
 

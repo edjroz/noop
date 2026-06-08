@@ -73,11 +73,12 @@ public final class SyncController: ObservableObject {
             return
         }
 
-        // Bootstrap schema (no-op if hash already cached).
+        // Bootstrap schema (no-op if hash already cached). v1.0.0-rc1 dropped the HTTP schema
+        // endpoint; DefraSchema.bootstrap shells out to `defradb client collection add -`.
         let cachedHash = UserDefaults.standard.string(forKey: "defra.schema.hash")
         if cachedHash != DefraSchema.sha256Hex {
             do {
-                try await client.loadSchema(DefraSchema.sdl)
+                try await DefraSchema.bootstrap(binaryURL: sidecar.binaryURL)
                 UserDefaults.standard.set(DefraSchema.sha256Hex, forKey: "defra.schema.hash")
             } catch {
                 phase = .sidecarFailed("schema: \(error)")
@@ -144,6 +145,12 @@ public final class SyncController: ObservableObject {
     }
 
     public func retryNow() async {
+        // If the sidecar never came up (Failed) or never started, re-run the bring-up sequence —
+        // start() is idempotent for the .running case and re-tries everything for .sidecarFailed.
+        if case .sidecarFailed = phase {
+            await start()
+            return
+        }
         await syncer?.drainOutbox()
         await subscriber?.pokeNow()
         await refreshCounts()
@@ -223,19 +230,36 @@ public enum SyncPaths {
         return base
     }
 
-    /// Look up the vendored defradb binary. Order: bundled with the app, `Tools/defradb/...`
-    /// (dev builds), `/opt/homebrew/bin/defradb`, `/usr/local/bin/defradb`.
+    /// Look up the vendored defradb binary. Order:
+    /// 1. `UserDefaults["defra.binary.path"]` — explicit override (set via the "Pick binary…"
+    ///    button in Sync settings, or `defaults write com.noopapp.noop defra.binary.path <path>`).
+    /// 2. Bundled inside the app (added via Xcode "Copy Bundle Resources" phase).
+    /// 3. `Tools/defradb/defradb-darwin-<arch>` relative to a recorded project root
+    ///    (`UserDefaults["defra.project.root"]`, persisted the first time the override is set).
+    /// 4. `/opt/homebrew/bin/defradb` and `/usr/local/bin/defradb` (Homebrew installs).
+    /// Returns the first candidate that exists on disk. If none exist, returns the last fallback
+    /// so the resulting "binary not found" error surfaces a real path for debugging.
     public static func defraBinaryURL() -> URL {
         let arch = currentArch()
+        let fm = FileManager.default
+
+        if let override = UserDefaults.standard.string(forKey: "defra.binary.path"),
+           fm.fileExists(atPath: override) {
+            return URL(fileURLWithPath: override)
+        }
         if let bundled = Bundle.main.url(forResource: "defradb-darwin-\(arch)", withExtension: nil) {
             return bundled
         }
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        let toolPath = cwd.appendingPathComponent("Tools/defradb/defradb-darwin-\(arch)")
-        if FileManager.default.fileExists(atPath: toolPath.path) { return toolPath }
+        if let projectRoot = UserDefaults.standard.string(forKey: "defra.project.root") {
+            let toolPath = URL(fileURLWithPath: projectRoot)
+                .appendingPathComponent("Tools/defradb/defradb-darwin-\(arch)")
+            if fm.fileExists(atPath: toolPath.path) { return toolPath }
+        }
         let brewARM = URL(fileURLWithPath: "/opt/homebrew/bin/defradb")
-        if FileManager.default.fileExists(atPath: brewARM.path) { return brewARM }
-        return URL(fileURLWithPath: "/usr/local/bin/defradb")
+        if fm.fileExists(atPath: brewARM.path) { return brewARM }
+        let brewIntel = URL(fileURLWithPath: "/usr/local/bin/defradb")
+        if fm.fileExists(atPath: brewIntel.path) { return brewIntel }
+        return brewARM
     }
 
     private static func currentArch() -> String {

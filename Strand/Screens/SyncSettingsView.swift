@@ -78,12 +78,35 @@ struct SyncSettingsView: View {
                 }
             }
             HStack {
+                Button("Pick binary…") { pickBinary() }
+                    .buttonStyle(.bordered)
                 Button("Install LaunchAgent") { installLaunchAgent() }
                     .buttonStyle(.bordered)
                 Button("Retry sync") { Task { await model.sync?.retryNow() } }
                     .buttonStyle(.bordered)
             }
+            if let path = UserDefaults.standard.string(forKey: "defra.binary.path") {
+                Text("Binary: \(path)")
+                    .font(StrandFont.mono(11))
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
         }
+    }
+
+    /// Show an NSOpenPanel scoped to executables. Stores the picked path in UserDefaults so the
+    /// next sidecar start finds it. Use this once after first run — the override is sticky.
+    private func pickBinary() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Pick defradb binary"
+        panel.title = "Select the defradb executable"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        UserDefaults.standard.set(url.path, forKey: "defra.binary.path")
+        statusMessage = "Binary set to \(url.path). Toggle sync off/on, or hit Retry sync."
     }
 
     private var phasePill: some View {
@@ -218,6 +241,9 @@ struct SyncSettingsView: View {
     private var cautionCard: some View {
         SyncSection(icon: "info.circle", title: "Heads-up") {
             Text("Journal notes use last-edit-wins. If you edit the same note on both Macs while offline, one edit will be overwritten when they reconnect.")
+                .font(StrandFont.footnote)
+                .foregroundStyle(StrandPalette.textSecondary)
+            Text("DefraDB alpha runs with an ephemeral libp2p identity, so this Mac's peer multiaddr changes every time the sidecar restarts. Re-add the peer on the other Mac after a restart.")
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textSecondary)
             if let msg = statusMessage {

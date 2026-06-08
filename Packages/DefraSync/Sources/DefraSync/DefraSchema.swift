@@ -103,4 +103,58 @@ public enum DefraSchema {
         let hash = SHA256.hash(data: data)
         return hash.map { String(format: "%02x", $0) }.joined()
     }
+
+    public enum BootstrapError: Error, Equatable {
+        case launchFailed(String)
+        case nonZeroExit(code: Int32, stderr: String)
+    }
+
+    /// Load `sdl` into a running DefraDB sidecar.
+    ///
+    /// v1.0.0-rc1 dropped the `POST /api/v0/schema` HTTP endpoint, so we shell out to the same
+    /// binary that's running the sidecar: `defradb client collection add --url <url> -`, piping
+    /// the SDL on stdin. If the schema is already loaded, defradb prints "collection already
+    /// exists" to stderr and exits non-zero — we treat that as success so re-runs are safe.
+    public static func bootstrap(binaryURL: URL,
+                                 httpPort: Int = 9181,
+                                 sdl: String = sdl) async throws {
+        let p = Process()
+        p.executableURL = binaryURL
+        p.arguments = [
+            "client", "collection", "add",
+            "--url", "127.0.0.1:\(httpPort)",
+            "-",
+        ]
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        p.standardInput = stdinPipe
+        p.standardOutput = stdoutPipe
+        p.standardError = stderrPipe
+
+        do {
+            try p.run()
+        } catch {
+            throw BootstrapError.launchFailed("\(error)")
+        }
+
+        // Write SDL on stdin and close so the CLI knows we're done.
+        try? stdinPipe.fileHandleForWriting.write(contentsOf: Data(sdl.utf8))
+        try? stdinPipe.fileHandleForWriting.close()
+
+        // Drain pipes off-actor to avoid the buffer-fills-and-blocks classic.
+        let stderrData = await Task.detached { stderrPipe.fileHandleForReading.readDataToEndOfFile() }.value
+        let _ = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+
+        p.waitUntilExit()
+        if p.terminationStatus == 0 { return }
+
+        let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+        // Treat "already exists" as idempotent success (alpha's spelling can drift).
+        let lower = stderr.lowercased()
+        if lower.contains("already exists") || lower.contains("already added") || lower.contains("schema is already") {
+            return
+        }
+        throw BootstrapError.nonZeroExit(code: p.terminationStatus, stderr: stderr)
+    }
 }
