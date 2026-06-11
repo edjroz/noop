@@ -70,6 +70,17 @@ if [[ "${DO_BUILD}" == 1 ]]; then
         exit 1
     fi
     xcodegen generate
+
+    # Ensure DefraEmbed.xcframework exists BEFORE opening Xcode. SwiftPM's binary-target
+    # path resolution runs during dependency-graph evaluation — that's earlier than any
+    # build phase, so the project.yml preBuildScripts wouldn't catch a missing framework.
+    # The build script itself is fast (~150ms) when the framework is already current.
+    if [[ -x "Tools/defradb-embed/build.sh" ]]; then
+        echo "→ Ensuring DefraEmbed.xcframework is current"
+        ./Tools/defradb-embed/build.sh || {
+            echo "⚠️  DefraEmbed.xcframework build failed; Xcode will report a missing .binaryTarget." >&2
+        }
+    fi
 fi
 
 if [[ "${DO_DATA}" == 1 ]]; then
