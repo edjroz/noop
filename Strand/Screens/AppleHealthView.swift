@@ -254,7 +254,7 @@ struct AppleHealthView: View {
     }
 
     /// Header subtitle reflects the windowed (visible) per-day span.
-    private var spanSubtitle: String? {
+    private var spanSubtitle: String {
         let rows = loaded ? windowedRows : appleRows
         guard let first = rows.first?.day, let last = rows.last?.day,
               let lo = date(first), let hi = date(last) else {
