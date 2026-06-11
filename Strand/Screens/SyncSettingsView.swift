@@ -84,17 +84,16 @@ struct SyncSettingsView: View {
         }
     }
 
+    @ViewBuilder
     private var phasePill: some View {
-        let phase = model.sync?.phase ?? .disabled
-        let (label, tone): (String, StrandTone) = {
-            switch phase {
-            case .disabled: return ("Disabled", .neutral)
-            case .sidecarStarting: return ("Starting…", .warning)
-            case .sidecarFailed: return ("Failed", .critical)
-            case .running: return ("Running", .positive)
-            }
-        }()
-        return StatePill(label, tone: tone, pulsing: phase == .sidecarStarting)
+        // StatePill takes a LocalizedStringKey, which only resolves at compile time when each
+        // label is a literal — passing a variable would skip the String Catalog extractor.
+        switch model.sync?.phase ?? .disabled {
+        case .disabled:        StatePill("Disabled", tone: .neutral)
+        case .sidecarStarting: StatePill("Starting…", tone: .warning, pulsing: true)
+        case .sidecarFailed:   StatePill("Failed", tone: .critical)
+        case .running:         StatePill("Running", tone: .positive)
+        }
     }
 
     // MARK: - This node
