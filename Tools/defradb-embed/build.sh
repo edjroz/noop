@@ -36,22 +36,28 @@ fi
 STAGE_DIR="$(mktemp -d -t defradb-embed-build.XXXXXX)"
 trap 'rm -rf "${STAGE_DIR}"' EXIT
 
-# Brew's `go` shim resolves GOROOT through a stale env on this machine — we
-# already hit a "version 'go1.24.6' does not match go tool version 'go1.25.5'"
-# wedge in Phase 1. Pin everything to go@1.25 explicitly to avoid a repeat.
-GO_PREFIX="/opt/homebrew/opt/go@1.25"
-if [[ ! -x "${GO_PREFIX}/bin/go" ]]; then
-    echo "❌ go@1.25 not found at ${GO_PREFIX}. Install with: brew install go@1.25" >&2
+# The module needs Go >= 1.25.5 (see go.mod). Use whatever `go` is on PATH and
+# ask the binary for its own GOROOT — hard-coding a Cellar path is what caused
+# the "version 'go1.24.6' does not match go tool version 'go1.25.5'" wedge in
+# Phase 1, since the path and the binary could drift apart. Override the binary
+# with GO_BIN=/path/to/go if you need a specific toolchain.
+GO_BIN="${GO_BIN:-go}"
+if ! command -v "${GO_BIN}" >/dev/null 2>&1; then
+    echo "❌ go not found on PATH. Install with: brew install go (or set GO_BIN=/path/to/go)" >&2
     exit 1
 fi
-GO_VERSION_FULL="$("${GO_PREFIX}/bin/go" version | awk '{print $3}')"   # e.g. go1.25.5
-GO_VERSION="${GO_VERSION_FULL#go}"                                       # 1.25.5
-GOROOT="/opt/homebrew/Cellar/go/${GO_VERSION}/libexec"
+GO_VERSION_FULL="$("${GO_BIN}" version | awk '{print $3}')"             # e.g. go1.26.4
+GO_VERSION="${GO_VERSION_FULL#go}"                                       # 1.26.4
+MIN_VERSION="1.25.5"
+if [[ "$(printf '%s\n%s\n' "${MIN_VERSION}" "${GO_VERSION}" | sort -V | head -1)" != "${MIN_VERSION}" ]]; then
+    echo "❌ Go ${GO_VERSION} is older than the required ${MIN_VERSION} (see go.mod)." >&2
+    exit 1
+fi
+GOROOT="$("${GO_BIN}" env GOROOT)"
 if [[ ! -d "${GOROOT}" ]]; then
     echo "❌ Resolved GOROOT does not exist: ${GOROOT}" >&2
     exit 1
 fi
-export PATH="${GO_PREFIX}/bin:${PATH}"
 export GOROOT
 echo "→ Go ${GO_VERSION} (GOROOT=${GOROOT})"
 
@@ -70,7 +76,7 @@ build_arch() {
 
     echo "→ Building darwin/${arch} → ${out_dylib##*/}"
     GOOS=darwin GOARCH="${arch}" SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" \
-        go -C "${EMBED_DIR}" build \
+        "${GO_BIN}" -C "${EMBED_DIR}" build \
             -buildmode=c-shared \
             -ldflags="-s -w" \
             -trimpath \
