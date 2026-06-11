@@ -1,0 +1,5 @@
+framework module DefraEmbed {
+    umbrella header "DefraEmbed.h"
+    export *
+    module * { export * }
+}

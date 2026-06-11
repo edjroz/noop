@@ -74,6 +74,12 @@ export.zip
 # The script + checksum file are committed so both Macs land on the same pinned version.
 Tools/defradb/defradb-darwin-*
 
+# ── DefraEmbed.xcframework (DefraSync experiment, Phase 2) ──────
+# ~60–110 MB build artifact of Tools/defradb-embed/build.sh; rebuild locally,
+# never commit. The Go module under Packages/DefraSync/defradb-embed/ that
+# produces it IS committed.
+Packages/DefraSync/DefraEmbed.xcframework/
+
 # ── Python bytecode (tools/linux-capture) ─────────────────────────
 __pycache__/
 *.pyc
