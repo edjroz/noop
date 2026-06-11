@@ -1,7 +1,7 @@
 import Foundation
 import CryptoKit
 
-/// GraphQL SDL for the 5 synced collections + idempotent bootstrap into a running DefraDB sidecar.
+/// GraphQL SDL for the 5 synced collections + idempotent bootstrap into a running DefraDB host.
 ///
 /// Each type has a `naturalKey` field that is the deterministic primary identifier across nodes —
 /// see `DefraDocKey` for the format. Marking it `@index(unique: true)` lets us upsert by querying

@@ -1,12 +1,11 @@
 import Foundation
 
-/// Brings up the embedded DefraDB inside the host process.
+/// Owns the in-process DefraDB runtime: data dir, HTTP/p2p listeners, lifecycle.
 ///
-/// Phase 3 of the embed work removed the child-process path entirely. The historical name
-/// "sidecar" stays because `SyncController` and the Sync settings view treat this as the
-/// runtime lifecycle for an embedded DefraDB instance regardless of whether the implementation
-/// is in-process (current) or child-process (previous). Renaming the type cascades through too
-/// many callers for a Phase 3 commit; we can rename after the experiment stabilizes.
+/// Phase 3 of the embed work removed the child-process path entirely — DefraDB now runs inside
+/// this app's process via `DefraEmbedRuntime` (the Go-side `node.Node` bindings shipped in
+/// `DefraEmbed.xcframework`). The earlier name was `DefraSidecar` from the child-process era;
+/// renamed because the implementation no longer matches.
 ///
 /// Lifecycle:
 /// 1. `start()` first probes the in-process HTTP server via `DefraClient.health()` — useful
@@ -15,12 +14,12 @@ import Foundation
 /// 2. Otherwise, call `DefraEmbedRuntime.start(...)` which spins up the Go-side `node.Node`,
 ///    binds HTTP on `httpPort`, libp2p on `p2pPort`. Returns when the listener is bound.
 /// 3. `stop()` invokes `DefraEmbedRuntime.stop()`.
-public enum SidecarError: Error {
+public enum HostError: Error {
     case launchFailed(String)
 }
 
 @MainActor
-public final class DefraSidecar {
+public final class DefraHost {
     public let dataDir: URL
     public let httpPort: Int
     public let p2pPort: Int
@@ -65,7 +64,7 @@ public final class DefraSidecar {
             )
         } catch {
             status = .stopped
-            throw SidecarError.launchFailed("\(error)")
+            throw HostError.launchFailed("\(error)")
         }
         status = .running(ownsProcess: true)
         return status

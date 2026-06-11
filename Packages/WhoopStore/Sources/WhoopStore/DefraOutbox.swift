@@ -1,7 +1,7 @@
 import Foundation
 import GRDB
 
-/// One pending mutation queued for the DefraDB sidecar. Lives in `defra_outbox` (v10).
+/// One pending mutation queued for the DefraDB host. Lives in `defra_outbox` (v10).
 public struct DefraOutboxRow: Equatable {
     public let id: Int64
     public let collection: String

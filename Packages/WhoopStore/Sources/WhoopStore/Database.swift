@@ -237,7 +237,7 @@ extension WhoopStore {
             }
         }
 
-        // v12 (DefraSync fork): outbox for the DefraDB sync mirror. When the sidecar is unreachable,
+        // v12 (DefraSync fork): outbox for the DefraDB sync mirror. When the host is unreachable,
         // upserts get queued here and drained on reconnect. Natural key (collection, naturalKey)
         // coalesces repeated offline updates of the same row down to one pending mutation. This was
         // numbered v10 in our experiment branch before the upstream merge — renumbered to land cleanly

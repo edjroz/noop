@@ -71,7 +71,7 @@ public actor DefraSubscriber {
         do {
             data = try await client.graphql(query)
         } catch {
-            return    // sidecar down or transient — try next round
+            return    // host down or transient — try next round
         }
         guard let envelope = data as? [String: Any],
               let rows = envelope[type] as? [[String: Any]],

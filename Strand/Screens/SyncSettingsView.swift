@@ -5,9 +5,9 @@ import WhoopStore
 
 /// "Sync (Experimental)" panel. Lives under the Settings screen.
 ///
-/// Surfaces: enable toggle, sidecar status, this node's multiaddr (for the user to paste on the
+/// Surfaces: enable toggle, host status, this node's multiaddr (for the user to paste on the
 /// other Mac), the peer list, outbox depth, per-machine mock-data buttons, and a few danger
-/// affordances (Install LaunchAgent, Reset Defra data dir). Every action that talks to the sidecar
+/// affordances (Install LaunchAgent, Reset Defra data dir). Every action that talks to the host
 /// goes through `AppModel.sync` (the `SyncController`).
 struct SyncSettingsView: View {
     @EnvironmentObject var model: AppModel
@@ -20,7 +20,7 @@ struct SyncSettingsView: View {
     var body: some View {
         ScreenScaffold(
             title: "Sync (Experimental)",
-            subtitle: "Mirror your derived metrics across two Macs over DefraDB (alpha). Localhost sidecar — your data still stays out of the cloud."
+            subtitle: "Mirror your derived metrics across two Macs over DefraDB (alpha). In-process host — your data still stays out of the cloud."
         ) {
             toggleCard
             if syncEnabled {
@@ -47,19 +47,19 @@ struct SyncSettingsView: View {
                         else { await model.teardownSync() }
                     }
                 }
-            Text("This brings up a local DefraDB sidecar process and mirrors your sleep, daily, journal, workout, and Apple-Health summaries into it. Peer-to-peer sync replicates them to your other Mac.")
+            Text("This brings up an in-process DefraDB instance and mirrors your sleep, daily, journal, workout, and Apple-Health summaries into it. Peer-to-peer sync replicates them to your other Mac.")
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textSecondary)
         }
     }
 
-    // MARK: - Sidecar status
+    // MARK: - Host status
 
     @ViewBuilder
     private var statusCard: some View {
-        SyncSection(icon: "server.rack", title: "Sidecar") {
+        SyncSection(icon: "server.rack", title: "Host") {
             phasePill
-            if case .sidecarFailed(let msg) = model.sync?.phase ?? .disabled {
+            if case .hostFailed(let msg) = model.sync?.phase ?? .disabled {
                 Text(msg)
                     .font(StrandFont.footnote)
                     .foregroundStyle(StrandPalette.statusCritical)
@@ -90,8 +90,8 @@ struct SyncSettingsView: View {
         // label is a literal — passing a variable would skip the String Catalog extractor.
         switch model.sync?.phase ?? .disabled {
         case .disabled:        StatePill("Disabled", tone: .neutral)
-        case .sidecarStarting: StatePill("Starting…", tone: .warning, pulsing: true)
-        case .sidecarFailed:   StatePill("Failed", tone: .critical)
+        case .hostStarting: StatePill("Starting…", tone: .warning, pulsing: true)
+        case .hostFailed:   StatePill("Failed", tone: .critical)
         case .running:         StatePill("Running", tone: .positive)
         }
     }
@@ -111,7 +111,7 @@ struct SyncSettingsView: View {
                 }
                 .buttonStyle(.bordered)
             } else {
-                Text("Waiting for sidecar to report its address…")
+                Text("Waiting for the host to report its address…")
                     .font(StrandFont.footnote)
                     .foregroundStyle(StrandPalette.textTertiary)
             }
@@ -233,7 +233,7 @@ struct SyncSettingsView: View {
             Text("Journal notes use last-edit-wins. If you edit the same note on both Macs while offline, one edit will be overwritten when they reconnect.")
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textSecondary)
-            Text("DefraDB alpha runs with an ephemeral libp2p identity, so this Mac's peer multiaddr changes every time the sidecar restarts. Re-add the peer on the other Mac after a restart.")
+            Text("DefraDB alpha runs with an ephemeral libp2p identity, so this Mac's peer multiaddr changes every time the host restarts. Re-add the peer on the other Mac after a restart.")
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textSecondary)
             if let msg = statusMessage {

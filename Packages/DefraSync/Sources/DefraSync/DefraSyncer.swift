@@ -75,8 +75,8 @@ public actor DefraSyncer: WhoopStoreObserver {
 
     // MARK: - Outbox drain
 
-    /// Pull pending rows, publish, ack on success. Best-effort — silent no-op if the sidecar is
-    /// still down. Caller (SyncController) decides when to call this (sidecar-healthy transition,
+    /// Pull pending rows, publish, ack on success. Best-effort — silent no-op if the host is
+    /// still down. Caller (SyncController) decides when to call this (host-healthy transition,
     /// periodic 30s timer, manual "Retry sync" button).
     public func drainOutbox(batchSize: Int = 100) async {
         let rows = (try? await store.outboxFetchBatch(limit: batchSize)) ?? []

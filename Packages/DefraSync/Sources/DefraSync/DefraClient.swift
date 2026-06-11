@@ -1,15 +1,15 @@
 import Foundation
 
-/// Thin HTTP + WebSocket client for the DefraDB sidecar. Talks REST for schema bootstrap and
-/// p2p management, GraphQL-over-HTTP for queries/mutations, and graphql-ws over WebSocket for
+/// Thin HTTP + WebSocket client for the in-process DefraDB host. Talks REST for schema bootstrap
+/// and p2p management, GraphQL-over-HTTP for queries/mutations, and graphql-ws over WebSocket for
 /// subscriptions. URLSession-based — no third-party deps.
 ///
 /// All methods are `actor`-safe (the actor is the client itself). Errors surface as `DefraError`
-/// so callers (the syncer + subscriber) can branch on "sidecar unreachable" vs "schema rejected"
+/// so callers (the syncer + subscriber) can branch on "host unreachable" vs "schema rejected"
 /// without parsing strings.
 public enum DefraError: Error, Equatable {
-    case sidecarUnreachable                 // connection refused / network drop
-    case http(status: Int, body: String)    // sidecar returned a non-2xx
+    case hostUnreachable                    // connection refused / network drop
+    case http(status: Int, body: String)    // host returned a non-2xx
     case graphqlError(String)               // GraphQL "errors": [...] in the response
     case decoding(String)                   // response didn't match the expected shape
 }
@@ -20,7 +20,7 @@ public actor DefraClient {
 
     public init(baseURL: URL = URL(string: "http://127.0.0.1:9181")!) {
         self.baseURL = baseURL
-        // Short timeouts: the sidecar is localhost — if it doesn't respond in 5s, treat it as down.
+        // Short timeouts: the host is localhost — if it doesn't respond in 5s, treat it as down.
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 5
         cfg.timeoutIntervalForResource = 10
@@ -31,7 +31,7 @@ public actor DefraClient {
 
     /// v1.0.0-rc1 doesn't expose `/api/v0/health` — that path 404s. We probe `/api/v0/graphql`
     /// directly: any HTTP response (even a GraphQL-level error like "collection not found",
-    /// which is what defradb returns on a fresh data dir with no schemas) proves the sidecar is
+    /// which is what defradb returns on a fresh data dir with no schemas) proves the host is
     /// up. Only a transport-level failure (connection refused) means it isn't.
     public func health() async -> Bool {
         var req = URLRequest(url: baseURL.appendingPathComponent("api/v0/graphql"))
@@ -64,9 +64,9 @@ public actor DefraClient {
         do {
             (data, resp) = try await session.data(for: req)
         } catch {
-            throw DefraError.sidecarUnreachable
+            throw DefraError.hostUnreachable
         }
-        guard let http = resp as? HTTPURLResponse else { throw DefraError.sidecarUnreachable }
+        guard let http = resp as? HTTPURLResponse else { throw DefraError.hostUnreachable }
         guard (200..<300).contains(http.statusCode) else {
             throw DefraError.http(status: http.statusCode,
                                   body: String(data: data, encoding: .utf8) ?? "")
@@ -91,7 +91,7 @@ public actor DefraClient {
         req.httpMethod = "GET"
         let (data, resp) = try await session.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw DefraError.sidecarUnreachable
+            throw DefraError.hostUnreachable
         }
         let parsed = try? JSONSerialization.jsonObject(with: data)
 
@@ -124,7 +124,7 @@ public actor DefraClient {
         req.httpMethod = "GET"
         let (data, resp) = try await session.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw DefraError.sidecarUnreachable
+            throw DefraError.hostUnreachable
         }
         let parsed = try? JSONSerialization.jsonObject(with: data)
         if let arr = parsed as? [String] { return arr }

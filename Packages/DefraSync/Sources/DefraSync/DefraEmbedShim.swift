@@ -12,7 +12,7 @@ import Foundation
 /// pass `[String]` across the C boundary, and the nil-on-success error convention.
 ///
 /// Stage A of Phase 3: the shim exists, but no caller uses it yet. Stage B switches
-/// `DefraSidecar` / `DefraSchema` / `DefraP2P` over.
+/// `DefraHost` / `DefraSchema` / `DefraP2P` over.
 public enum DefraEmbedRuntime {
 
     public enum Error: Swift.Error, Equatable {
@@ -22,7 +22,7 @@ public enum DefraEmbedRuntime {
     // MARK: - Lifecycle
 
     /// Bring up the in-process DefraDB at `rootdir`, binding HTTP at `httpListen` and libp2p at
-    /// `p2pListen`. `devMode = true` matches the sidecar's `--development --no-keyring` posture.
+    /// `p2pListen`. `devMode = true` matches the legacy CLI's `--development --no-keyring` posture.
     public static func start(rootdir: String,
                              httpListen: String,
                              p2pListen: String,

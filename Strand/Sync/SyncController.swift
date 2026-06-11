@@ -3,7 +3,7 @@ import Combine
 import DefraSync
 import WhoopStore
 
-/// `@MainActor` orchestrator owned by `AppModel`. Brings up the sidecar, wires `DefraSyncer` as
+/// `@MainActor` orchestrator owned by `AppModel`. Brings up the host, wires `DefraSyncer` as
 /// the `WhoopStoreObserver`, starts the polling subscriber, and exposes published state for the
 /// "Sync (Experimental)" settings panel.
 ///
@@ -16,8 +16,8 @@ public final class SyncController: ObservableObject {
 
     public enum Phase: Equatable {
         case disabled
-        case sidecarStarting
-        case sidecarFailed(String)
+        case hostStarting
+        case hostFailed(String)
         case running
     }
 
@@ -33,7 +33,7 @@ public final class SyncController: ObservableObject {
 
     private let store: WhoopStore
     private let repoRefresh: @MainActor () async -> Void
-    private let sidecar: DefraSidecar
+    private let host: DefraHost
     private let client: DefraClient
     private var syncer: DefraSyncer?
     private var subscriber: DefraSubscriber?
@@ -48,7 +48,7 @@ public final class SyncController: ObservableObject {
                 nodeLabel: String = Host.current().localizedName ?? "unknown-mac") {
         self.store = store
         self.repoRefresh = repoRefresh
-        self.sidecar = DefraSidecar(dataDir: dataDir)
+        self.host = DefraHost(dataDir: dataDir)
         self.client = DefraClient()
         self.syncer = nil
         self.subscriber = nil
@@ -60,15 +60,15 @@ public final class SyncController: ObservableObject {
 
     // MARK: - Public lifecycle
 
-    /// Bring up the sidecar, load schema, attach the observer, start the subscriber. Idempotent.
+    /// Bring up the host, load schema, attach the observer, start the subscriber. Idempotent.
     public func start() async {
         guard UserDefaults.standard.bool(forKey: "sync.enabled") else { phase = .disabled; return }
-        guard phase != .running, phase != .sidecarStarting else { return }
-        phase = .sidecarStarting
+        guard phase != .running, phase != .hostStarting else { return }
+        phase = .hostStarting
         do {
-            _ = try await sidecar.start()
+            _ = try await host.start()
         } catch {
-            phase = .sidecarFailed("\(error)")
+            phase = .hostFailed("\(error)")
             return
         }
 
@@ -81,7 +81,7 @@ public final class SyncController: ObservableObject {
                 try DefraSchema.bootstrap()
                 UserDefaults.standard.set(DefraSchema.sha256Hex, forKey: "defra.schema.hash")
             } catch {
-                phase = .sidecarFailed("schema: \(error)")
+                phase = .hostFailed("schema: \(error)")
                 return
             }
         }
@@ -93,7 +93,7 @@ public final class SyncController: ObservableObject {
                 names: DefraTypeName.allCollections.compactMap(DefraTypeName.graphqlType(for:))
             )
         } catch {
-            phase = .sidecarFailed("p2p collection add: \(error)")
+            phase = .hostFailed("p2p collection add: \(error)")
             return
         }
 
@@ -136,7 +136,7 @@ public final class SyncController: ObservableObject {
         await store.setObserver(nil)
         syncer = nil
         subscriber = nil
-        sidecar.stop()
+        host.stop()
         phase = .disabled
     }
 
@@ -162,9 +162,9 @@ public final class SyncController: ObservableObject {
     }
 
     public func retryNow() async {
-        // If the sidecar never came up (Failed) or never started, re-run the bring-up sequence —
-        // start() is idempotent for the .running case and re-tries everything for .sidecarFailed.
-        if case .sidecarFailed = phase {
+        // If the host never came up (Failed) or never started, re-run the bring-up sequence —
+        // start() is idempotent for the .running case and re-tries everything for .hostFailed.
+        if case .hostFailed = phase {
             await start()
             return
         }
@@ -173,11 +173,11 @@ public final class SyncController: ObservableObject {
         await refreshCounts()
     }
 
-    /// "Reset Defra data dir" danger button. Stops the sidecar, deletes the data dir, clears
+    /// "Reset Defra data dir" danger button. Stops the host, deletes the data dir, clears
     /// schema/backfill caches. The next `start()` re-bootstraps everything.
     public func resetDataDir() async throws {
         await stop()
-        try FileManager.default.removeItem(at: sidecar.dataDir)
+        try FileManager.default.removeItem(at: host.dataDir)
         UserDefaults.standard.removeObject(forKey: "defra.schema.hash")
         UserDefaults.standard.removeObject(forKey: "defra.backfill.done")
     }
