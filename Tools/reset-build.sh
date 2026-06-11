@@ -118,52 +118,23 @@ SQL
         echo "(no whoop.sqlite yet, skipping SQL wipe)"
     fi
 
-    # Stop the sidecar BEFORE deleting its data dir. A live defradb process keeps the Badger
-    # files open (open fds survive unlink), so it would keep serving the old documents on :9181
-    # and the next sync would re-flood SQLite. Order: bootout launchd (else KeepAlive respawns
-    # it), then kill any process bound to OUR rootdir, then verify the dir delete sticks.
-    PLIST="${HOME}/Library/LaunchAgents/com.noopapp.defradb.plist"
-    if [[ -f "${PLIST}" ]]; then
-        echo "→ Booting out launchd-managed defradb sidecar"
-        launchctl bootout "gui/$(id -u)" "${PLIST}" 2>/dev/null || true
-    fi
-
-    SIDECAR_PAT="defradb.* --rootdir ${DEFRA_DIR}"
-    if pgrep -f "${SIDECAR_PAT}" >/dev/null; then
-        echo "→ Stopping defradb sidecar holding the OpenWhoop data dir"
-        # Try graceful first, then SIGKILL. The sidecar ignores SIGTERM (Badger flush can hang),
-        # and we're deleting the data dir anyway, so a clean shutdown buys us nothing.
-        pkill -TERM -f "${SIDECAR_PAT}" 2>/dev/null || true
-        for _ in 1 2 3 4 5 6; do
-            pgrep -f "${SIDECAR_PAT}" >/dev/null || break
-            sleep 0.5
-        done
-        if pgrep -f "${SIDECAR_PAT}" >/dev/null; then
-            echo "  …SIGTERM ignored, sending SIGKILL"
-            pkill -KILL -f "${SIDECAR_PAT}" 2>/dev/null || true
-            for _ in 1 2 3 4; do
-                pgrep -f "${SIDECAR_PAT}" >/dev/null || break
-                sleep 0.5
-            done
-        fi
-        if pgrep -f "${SIDECAR_PAT}" >/dev/null; then
-            echo "  ❌ defradb sidecar refused to die — kill it manually, then re-run." >&2
-            exit 1
-        fi
-    fi
-
+    # Phase 3 moved DefraDB in-process: there is no separate `defradb` subprocess to find
+    # and kill anymore. The data dir is held open by the NOOP app; the `pgrep -x NOOP` guard
+    # at the top of this script already enforces "Strand must be quit first", so once we get
+    # here nothing has the dir open and we can just remove it. Sanity-check the port is free
+    # afterwards in case a stray sidecar from a previous-binary build is still alive.
     if [[ -d "${DEFRA_DIR}" ]]; then
         echo "→ Removing DefraDB data dir"
         rm -rf "${DEFRA_DIR}"
     fi
 
-    # Read-back: if anything still answers on :9181, a sidecar is alive and the wipe won't stick.
-    if curl -fsS --max-time 2 "http://127.0.0.1:9181/api/v0/health" >/dev/null 2>&1; then
-        echo "  ❌ a defradb sidecar is still up on :9181 — old documents will re-sync." >&2
-        echo "     Find and kill it (pgrep -fl defradb), then re-run with --data." >&2
+    if curl -fsS --max-time 2 "http://127.0.0.1:9181/api/v0/graphql" \
+        -H 'Content-Type: application/json' -d '{"query":"{ __typename }"}' >/dev/null 2>&1; then
+        echo "  ❌ something is still serving DefraDB on :9181 — old documents will re-sync." >&2
+        echo "     Quit Strand fully, then re-run with --data." >&2
         exit 1
     fi
-    echo "  ✓ DefraDB cleared (no sidecar on :9181)"
+    echo "  ✓ DefraDB cleared (nothing answering on :9181)"
 
     echo "→ Clearing schema-hash and backfill-done UserDefaults"
     defaults delete com.noopapp.noop defra.schema.hash 2>/dev/null || true

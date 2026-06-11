@@ -78,35 +78,10 @@ struct SyncSettingsView: View {
                 }
             }
             HStack {
-                Button("Pick binary…") { pickBinary() }
-                    .buttonStyle(.bordered)
-                Button("Install LaunchAgent") { installLaunchAgent() }
-                    .buttonStyle(.bordered)
                 Button("Retry sync") { Task { await model.sync?.retryNow() } }
                     .buttonStyle(.bordered)
             }
-            if let path = UserDefaults.standard.string(forKey: "defra.binary.path") {
-                Text("Binary: \(path)")
-                    .font(StrandFont.mono(11))
-                    .foregroundStyle(StrandPalette.textTertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
         }
-    }
-
-    /// Show an NSOpenPanel scoped to executables. Stores the picked path in UserDefaults so the
-    /// next sidecar start finds it. Use this once after first run — the override is sticky.
-    private func pickBinary() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Pick defradb binary"
-        panel.title = "Select the defradb executable"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        UserDefaults.standard.set(url.path, forKey: "defra.binary.path")
-        statusMessage = "Binary set to \(url.path). Toggle sync off/on, or hit Retry sync."
     }
 
     private var phasePill: some View {
@@ -289,13 +264,6 @@ struct SyncSettingsView: View {
         }
     }
 
-    private func installLaunchAgent() {
-        // Phase 3 Stage B neutered this. DefraDB now runs in-process via DefraEmbed.xcframework;
-        // there's no separate sidecar binary to keep alive under launchd. The button + handler
-        // get removed in Stage C — until then we surface an explanatory message instead of
-        // crashing.
-        statusMessage = "Install LaunchAgent is no longer needed — DefraDB runs in-process. (This button will be removed.)"
-    }
 
     private func runSeeder(days: Int) async {
         working = true
