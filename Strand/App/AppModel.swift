@@ -174,12 +174,10 @@ final class AppModel: ObservableObject {
         guard UserDefaults.standard.bool(forKey: "sync.enabled") else { return }
         guard sync == nil, let store = await repo.storeHandle() else { return }
         let dir = (try? SyncPaths.defraDataDir()) ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let bin = SyncPaths.defraBinaryURL()
         let controller = SyncController(
             store: store,
             repoRefresh: { [weak self] in await self?.repo.refresh() },
-            dataDir: dir,
-            binaryURL: bin
+            dataDir: dir
         )
         // Forward the controller's @Published changes up to this AppModel so SyncSettingsView,
         // which observes AppModel via @EnvironmentObject, re-renders on phase / peer / outbox

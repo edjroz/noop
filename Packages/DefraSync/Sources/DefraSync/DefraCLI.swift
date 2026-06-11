@@ -1,9 +1,18 @@
 import Foundation
 
-/// Shared helper for invoking `defradb client …` against the running sidecar.
+// MARK: - Deprecated (Phase 3): kept as fallback during embedded-DefraDB stabilization.
+//
+// No longer called by `DefraSchema` / `DefraP2P` — those now route through
+// `DefraEmbedRuntime` (in-process Go via DefraEmbed.xcframework). Left in tree so we
+// can `git revert` quickly if the embedded path needs a known-good escape hatch during
+// rollout. Slated for deletion after a handful of green end-to-end runs on the embedded
+// runtime; reach for it before then if you need to drop back to the sidecar-style flow
+// without unwinding the embed work.
+
+/// Shared helper for invoking `defradb client …` against a running sidecar binary.
 ///
-/// Several pieces of the integration go through the CLI rather than HTTP because
-/// v1.0.0-rc1 doesn't expose the corresponding endpoints, or because the HTTP wire
+/// Several pieces of the integration historically went through the CLI rather than HTTP
+/// because v1.0.0-rc1 doesn't expose the corresponding endpoints, or because the HTTP wire
 /// shapes are still moving while the CLI surface is stable:
 ///   - `defradb client collection add`  (schema bootstrap; HTTP endpoint 404s)
 ///   - `defradb client p2p collection add`

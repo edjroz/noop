@@ -45,11 +45,10 @@ public final class SyncController: ObservableObject {
     public init(store: WhoopStore,
                 repoRefresh: @escaping @MainActor () async -> Void,
                 dataDir: URL,
-                binaryURL: URL,
                 nodeLabel: String = Host.current().localizedName ?? "unknown-mac") {
         self.store = store
         self.repoRefresh = repoRefresh
-        self.sidecar = DefraSidecar(binaryURL: binaryURL, dataDir: dataDir)
+        self.sidecar = DefraSidecar(dataDir: dataDir)
         self.client = DefraClient()
         self.syncer = nil
         self.subscriber = nil
@@ -73,12 +72,13 @@ public final class SyncController: ObservableObject {
             return
         }
 
-        // Bootstrap schema (no-op if hash already cached). v1.0.0-rc1 dropped the HTTP schema
-        // endpoint; DefraSchema.bootstrap shells out to `defradb client collection add -`.
+        // Bootstrap schema (no-op if hash already cached). Phase 3: routes through
+        // DefraEmbedRuntime.loadCollections; the Go side tolerates "already exists" so a
+        // forced replay on a hash bust is safe.
         let cachedHash = UserDefaults.standard.string(forKey: "defra.schema.hash")
         if cachedHash != DefraSchema.sha256Hex {
             do {
-                try await DefraSchema.bootstrap(binaryURL: sidecar.binaryURL)
+                try DefraSchema.bootstrap()
                 UserDefaults.standard.set(DefraSchema.sha256Hex, forKey: "defra.schema.hash")
             } catch {
                 phase = .sidecarFailed("schema: \(error)")
@@ -89,8 +89,7 @@ public final class SyncController: ObservableObject {
         // Subscribe this node to every collection's pubsub topic. Once both Macs are subscribed
         // and one dials the other via `p2p connect`, writes fan out symmetrically. Idempotent.
         do {
-            try await DefraP2P.subscribeCollections(
-                binaryURL: sidecar.binaryURL,
+            try DefraP2P.subscribeCollections(
                 names: DefraTypeName.allCollections.compactMap(DefraTypeName.graphqlType(for:))
             )
         } catch {
@@ -152,11 +151,7 @@ public final class SyncController: ObservableObject {
     /// every subsequent write) to the peer. For symmetric sync, both Macs add each other.
     public func addPeer(_ multiaddr: String) async throws {
         let collectionNames = DefraTypeName.allCollections.compactMap(DefraTypeName.graphqlType(for:))
-        try await DefraP2P.replicate(
-            binaryURL: sidecar.binaryURL,
-            collectionNames: collectionNames,
-            multiaddr: multiaddr
-        )
+        try DefraP2P.replicate(collectionNames: collectionNames, multiaddr: multiaddr)
         peers = (try? await client.activePeers()) ?? peers
     }
 
@@ -252,43 +247,8 @@ public enum SyncPaths {
         return base
     }
 
-    /// Look up the vendored defradb binary. Order:
-    /// 1. `UserDefaults["defra.binary.path"]` — explicit override (set via the "Pick binary…"
-    ///    button in Sync settings, or `defaults write com.noopapp.noop defra.binary.path <path>`).
-    /// 2. Bundled inside the app (added via Xcode "Copy Bundle Resources" phase).
-    /// 3. `Tools/defradb/defradb-darwin-<arch>` relative to a recorded project root
-    ///    (`UserDefaults["defra.project.root"]`, persisted the first time the override is set).
-    /// 4. `/opt/homebrew/bin/defradb` and `/usr/local/bin/defradb` (Homebrew installs).
-    /// Returns the first candidate that exists on disk. If none exist, returns the last fallback
-    /// so the resulting "binary not found" error surfaces a real path for debugging.
-    public static func defraBinaryURL() -> URL {
-        let arch = currentArch()
-        let fm = FileManager.default
-
-        if let override = UserDefaults.standard.string(forKey: "defra.binary.path"),
-           fm.fileExists(atPath: override) {
-            return URL(fileURLWithPath: override)
-        }
-        if let bundled = Bundle.main.url(forResource: "defradb-darwin-\(arch)", withExtension: nil) {
-            return bundled
-        }
-        if let projectRoot = UserDefaults.standard.string(forKey: "defra.project.root") {
-            let toolPath = URL(fileURLWithPath: projectRoot)
-                .appendingPathComponent("Tools/defradb/defradb-darwin-\(arch)")
-            if fm.fileExists(atPath: toolPath.path) { return toolPath }
-        }
-        let brewARM = URL(fileURLWithPath: "/opt/homebrew/bin/defradb")
-        if fm.fileExists(atPath: brewARM.path) { return brewARM }
-        let brewIntel = URL(fileURLWithPath: "/usr/local/bin/defradb")
-        if fm.fileExists(atPath: brewIntel.path) { return brewIntel }
-        return brewARM
-    }
-
-    private static func currentArch() -> String {
-        #if arch(arm64)
-        return "arm64"
-        #else
-        return "amd64"
-        #endif
-    }
+    // Phase 3 removed `defraBinaryURL()`. The embedded runtime no longer spawns a child
+    // process — `DefraEmbedRuntime.start(...)` runs DefraDB inside this process via the
+    // DefraEmbed.xcframework Go bindings. The data directory is still managed locally; see
+    // `defraDataDir()` above.
 }

@@ -106,25 +106,13 @@ public enum DefraSchema {
         return hash.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Load `sdl` into a running DefraDB sidecar.
+    /// Load `sdl` into the embedded DefraDB.
     ///
-    /// v1.0.0-rc1 dropped the `POST /api/v0/schema` HTTP endpoint, so we shell out to the same
-    /// binary that's running the sidecar: `defradb client collection add --url <url> -`, piping
-    /// the SDL on stdin. If the schema is already loaded, defradb prints "already exists" to
-    /// stderr and exits non-zero — we treat that as success so re-runs are safe.
-    public static func bootstrap(binaryURL: URL,
-                                 httpPort: Int = 9181,
-                                 sdl: String = sdl) async throws {
-        do {
-            _ = try await DefraCLI.run(
-                binaryURL: binaryURL,
-                args: ["client", "collection", "add", "--url", "127.0.0.1:\(httpPort)", "-"],
-                stdin: sdl
-            )
-        } catch let error where DefraCLI.isTolerable(error, anyOf: [
-            "already exists", "already added", "schema is already"
-        ]) {
-            return
-        }
+    /// Phase 3 routes this directly into `DefraEmbedRuntime.loadCollections(...)`. The Go side
+    /// tolerates "already exists" / "already added" / "schema is already" — re-running is safe,
+    /// which keeps the existing `UserDefaults["defra.schema.hash"]` cache semantics intact
+    /// (we still skip the call on a hash hit, but a forced replay won't blow up either).
+    public static func bootstrap(sdl: String = sdl) throws {
+        try DefraEmbedRuntime.loadCollections(sdl)
     }
 }

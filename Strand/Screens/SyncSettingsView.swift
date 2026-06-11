@@ -290,20 +290,11 @@ struct SyncSettingsView: View {
     }
 
     private func installLaunchAgent() {
-        working = true
-        Task {
-            // The SyncController doesn't expose a sidecar handle directly, so we re-derive paths.
-            let dir = (try? SyncPaths.defraDataDir()) ?? URL(fileURLWithPath: NSTemporaryDirectory())
-            let bin = SyncPaths.defraBinaryURL()
-            let sidecar = DefraSidecar(binaryURL: bin, dataDir: dir)
-            do {
-                let url = try sidecar.installLaunchAgent()
-                statusMessage = "LaunchAgent written to \(url.path). Load with: launchctl bootstrap gui/$UID \(url.path)"
-            } catch {
-                statusMessage = "Couldn't install LaunchAgent: \(error)"
-            }
-            working = false
-        }
+        // Phase 3 Stage B neutered this. DefraDB now runs in-process via DefraEmbed.xcframework;
+        // there's no separate sidecar binary to keep alive under launchd. The button + handler
+        // get removed in Stage C — until then we surface an explanatory message instead of
+        // crashing.
+        statusMessage = "Install LaunchAgent is no longer needed — DefraDB runs in-process. (This button will be removed.)"
     }
 
     private func runSeeder(days: Int) async {
