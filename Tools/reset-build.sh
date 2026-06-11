@@ -53,13 +53,24 @@ fi
 
 if [[ "${DO_BUILD}" == 1 ]]; then
     echo "→ Removing generated Xcode project"
-    rm -rf Strand.xcodeproj
+    rm -rf Strand.xcodeproj Strand.xcworkspace
 
     echo "→ Clearing SwiftPM global cache"
     rm -rf ~/Library/Caches/org.swift.swiftpm
+    rm -rf ~/Library/org.swift.swiftpm/security
 
     echo "→ Clearing DerivedData for this project"
     rm -rf ~/Library/Developer/Xcode/DerivedData/Strand-*
+
+    # Deeper Xcode-state nuke for the "PIF: multiple references with same GUID"
+    # class of error. The IDE keeps per-workspace package-graph state outside
+    # DerivedData, so a stale resolution can survive `--data` runs and collide
+    # with the freshly regenerated project graph. These caches are safe to drop —
+    # Xcode rebuilds them on the next open.
+    echo "→ Clearing Xcode IDE caches"
+    rm -rf ~/Library/Caches/com.apple.dt.Xcode
+    rm -rf ~/Library/Developer/Xcode/UserData/IDEEditorInteractivityHistory
+    rm -rf ~/Library/Developer/Xcode/UserData/IDEFindNavigatorScopes.plist
 
     echo "→ Wiping per-package .build / .swiftpm under Packages and Tools"
     find Packages Tools -type d \( -name .build -o -name .swiftpm \) -prune -exec rm -rf {} + 2>/dev/null || true

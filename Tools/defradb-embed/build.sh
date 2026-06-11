@@ -36,30 +36,68 @@ fi
 STAGE_DIR="$(mktemp -d -t defradb-embed-build.XXXXXX)"
 trap 'rm -rf "${STAGE_DIR}"' EXIT
 
-# The module needs Go >= 1.25.5 (see go.mod). Use whatever `go` is on PATH and
-# ask the binary for its own GOROOT — hard-coding a Cellar path is what caused
-# the "version 'go1.24.6' does not match go tool version 'go1.25.5'" wedge in
-# Phase 1, since the path and the binary could drift apart. Override the binary
-# with GO_BIN=/path/to/go if you need a specific toolchain.
-GO_BIN="${GO_BIN:-go}"
+# Toolchain selection. Override with GO_BIN=/path/to/go.
+#
+# Without an override, prefer Homebrew's go@1.25 keg if present. DefraDB v1.0.0-rc1
+# locks bytedance/sonic at v1.14.2, and that version reads Go runtime internals
+# directly — specifically a symbol called `GoMapIterator` that was restructured in
+# Go 1.26. Building defradb's dep tree with Go >= 1.26 currently fails with
+#   undefined: GoMapIterator
+# in internal/rt/stubs.go. Pin to Go 1.25.x until defradb ships a release that bumps
+# sonic past that restructure.
+if [[ -z "${GO_BIN:-}" ]]; then
+    if [[ -x /opt/homebrew/opt/go@1.25/bin/go ]]; then
+        GO_BIN=/opt/homebrew/opt/go@1.25/bin/go
+    else
+        GO_BIN=go
+    fi
+fi
+
 if ! command -v "${GO_BIN}" >/dev/null 2>&1; then
-    echo "❌ go not found on PATH. Install with: brew install go (or set GO_BIN=/path/to/go)" >&2
+    echo "❌ Go not found at '${GO_BIN}'." >&2
+    echo "   Install Go 1.25.x:  brew install go@1.25" >&2
+    echo "   Or set GO_BIN=/path/to/go if you have a manual install." >&2
     exit 1
 fi
-GO_VERSION_FULL="$("${GO_BIN}" version | awk '{print $3}')"             # e.g. go1.26.4
-GO_VERSION="${GO_VERSION_FULL#go}"                                       # 1.26.4
+
+GO_VERSION_FULL="$("${GO_BIN}" version | awk '{print $3}')"             # e.g. go1.25.5
+GO_VERSION="${GO_VERSION_FULL#go}"                                       # 1.25.5
 MIN_VERSION="1.25.5"
-if [[ "$(printf '%s\n%s\n' "${MIN_VERSION}" "${GO_VERSION}" | sort -V | head -1)" != "${MIN_VERSION}" ]]; then
-    echo "❌ Go ${GO_VERSION} is older than the required ${MIN_VERSION} (see go.mod)." >&2
+MAX_EXCLUSIVE="1.26.0"
+
+# True iff $1 < $2 by version sort (and not equal).
+ver_lt() {
+    [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$1" && "$1" != "$2" ]]
+}
+
+if ver_lt "${GO_VERSION}" "${MIN_VERSION}"; then
+    echo "❌ Go ${GO_VERSION} is older than the required ${MIN_VERSION} (see defradb-embed/go.mod)." >&2
+    echo "   brew install go@1.25 — then re-run." >&2
     exit 1
 fi
+
+if ! ver_lt "${GO_VERSION}" "${MAX_EXCLUSIVE}"; then
+    cat >&2 <<EOF
+❌ Go ${GO_VERSION} is too new for DefraDB v1.0.0-rc1's transitive deps.
+
+   bytedance/sonic v1.14.2 (pulled in by defradb) reads Go runtime internals and
+   references an undefined GoMapIterator symbol against Go >= 1.26. Use Go 1.25.x
+   until defradb ships a release with a sonic bump.
+
+       brew install go@1.25
+       (then either let this script auto-discover it, or set GO_BIN explicitly:)
+       GO_BIN=/opt/homebrew/opt/go@1.25/bin/go ${0##*/}
+EOF
+    exit 1
+fi
+
 GOROOT="$("${GO_BIN}" env GOROOT)"
 if [[ ! -d "${GOROOT}" ]]; then
     echo "❌ Resolved GOROOT does not exist: ${GOROOT}" >&2
     exit 1
 fi
 export GOROOT
-echo "→ Go ${GO_VERSION} (GOROOT=${GOROOT})"
+echo "→ Go ${GO_VERSION} (GOROOT=${GOROOT}, GO_BIN=${GO_BIN})"
 
 # CGo needs Clang from the host's macOS SDK. xcrun resolves it for us; we don't
 # hard-code a path.
