@@ -1,13 +1,14 @@
 import Foundation
 import WhoopStore
 
-/// Outbound mirror: `WhoopStoreObserver` impl that publishes every local upsert to DefraDB and
-/// queues into the SQLite outbox when the sidecar is unreachable.
+/// Outbound mirror: `WhoopStoreObserver` impl that publishes every local upsert to the
+/// in-process DefraDB and queues into the SQLite outbox when DefraDB rejects the mutation.
 ///
-/// Loop prevention: the inbound apply path (`DefraSubscriber`) wraps its `store.upsert*` calls
-/// in `SyncContext.$applyingFromDefra.withValue(true) { ... }`. WhoopStore uses `Task { ... }`
-/// (not `Task.detached`) to invoke us, so the task-local propagates here. We short-circuit
-/// without publishing or enqueuing — that row already came from the network.
+/// Loop prevention: the inbound apply path (`DefraSubscriber.apply`) passes `skipObserver: true`
+/// when calling `store.upsert*`, so this observer is never notified for rows that arrived over
+/// the network. The earlier `@TaskLocal`-based mechanism (see git history for `SyncContext`)
+/// was unreliable across Swift actor boundaries and `Task { }` initializers; the explicit
+/// parameter can't leak.
 public actor DefraSyncer: WhoopStoreObserver {
     private let client: DefraClient
     private let store: WhoopStore
@@ -24,8 +25,10 @@ public actor DefraSyncer: WhoopStoreObserver {
     // MARK: - WhoopStoreObserver
 
     public func didUpsert(collection: String, deviceId: String, payloadsJSON: [String]) async {
-        // Inbound apply suppression — see SyncContext docs.
-        if SyncContext.applyingFromDefra { return }
+        // Inbound apply suppression now lives upstream in WhoopStore: DefraSubscriber.apply
+        // passes `skipObserver: true` so this method is only reached for genuinely-local writes.
+        // Earlier versions guarded here on `SyncContext.applyingFromDefra` (@TaskLocal), which
+        // proved unreliable across actor boundaries and `Task { }` initializers.
         for json in payloadsJSON {
             await publishOrQueue(collection: collection, payloadJSON: json)
         }
@@ -33,8 +36,8 @@ public actor DefraSyncer: WhoopStoreObserver {
 
     // MARK: - Publish path
 
-    /// Try the sidecar; on any failure, enqueue to the outbox and return. Failures must not
-    /// throw back into the writer — see WhoopStore's `notifyObserver`.
+    /// Try the in-process DefraDB; on any failure, enqueue to the outbox and return. Failures
+    /// must not throw back into the writer — see WhoopStore's `notifyObserver`.
     private func publishOrQueue(collection: String, payloadJSON: String) async {
         guard let payload = decodePayload(payloadJSON),
               let key = DefraDocKey.key(for: collection, payload: payload),

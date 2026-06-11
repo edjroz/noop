@@ -11,12 +11,14 @@ public enum WhoopStoreInfo {
 }
 
 /// Observer hook invoked after a successful upsert into one of the synced metric-cache tables.
-/// Fires from a detached Task so a slow/failing observer cannot backpressure the writer.
-/// The mirror layer (DefraSync) implements this to publish rows out to the DefraDB sidecar.
-/// The observer must not call back into the same WhoopStore methods on the same row or it will
-/// recurse forever — the inbound apply path suppresses this with `SyncContext.applyingFromDefra`
-/// (a `@TaskLocal` declared in DefraSync). WhoopStore itself doesn't depend on that flag; the
-/// observer's caller is responsible for setting it before re-entering upserts.
+/// Fires from a child Task so a slow/failing observer cannot backpressure the writer.
+/// The mirror layer (DefraSync) implements this to publish rows out to the in-process DefraDB.
+///
+/// **Loop prevention for inbound-apply paths**: the upsert methods take a `skipObserver: Bool`
+/// flag (default `false`). The DefraDB inbound apply (`DefraSubscriber.apply`) passes
+/// `skipObserver: true` so rows that came in over the network do NOT re-fire this observer
+/// and bounce back out. The previous mechanism — a `@TaskLocal` flag checked inside the
+/// observer — proved unreliable across actor boundaries + `Task { }` initializers.
 ///
 /// Payload shape: one JSON object string per row, containing the natural-key columns plus every
 /// column the upsert wrote. Using JSON strings rather than `[String: Any]` keeps the protocol
@@ -34,15 +36,14 @@ public actor WhoopStore {
     private var observer: WhoopStoreObserver?
 
     /// Wire an observer that gets called after each successful upsert into a synced collection.
-    /// The observer must itself decide whether to skip a notification — WhoopStore cannot see
-    /// the inbound-apply @TaskLocal that lives in DefraSync. Loop prevention is the observer's job.
+    /// Inbound-apply suppression is opt-in per-call via the `skipObserver: Bool` parameter on
+    /// each `upsert*` method, not a property of the observer itself.
     public func setObserver(_ obs: WhoopStoreObserver?) { self.observer = obs }
 
-    /// Fire the observer (no-op if unset). Called from the upsert sites after `syncWrite` returns.
-    /// Uses a child `Task { ... }` (not `Task.detached`) so `@TaskLocal` values set by the inbound
-    /// apply path propagate into the observer — that's what lets `DefraSyncer.didUpsert` see
-    /// `SyncContext.applyingFromDefra == true` and skip re-publishing the row. The Task still
-    /// returns immediately from the writer's POV — observer work happens on its own executor.
+    /// Fire the observer (no-op if unset). Called from the upsert sites after `syncWrite` returns,
+    /// gated by each call's `skipObserver` flag. The observer dispatch goes through a child
+    /// `Task { ... }` so its work runs on its own executor — the writer's await returns
+    /// immediately and isn't blocked by a slow observer.
     func notifyObserver(collection: String, deviceId: String, payloadsJSON: [String]) {
         guard !payloadsJSON.isEmpty, let obs = observer else { return }
         Task { await obs.didUpsert(collection: collection, deviceId: deviceId, payloadsJSON: payloadsJSON) }

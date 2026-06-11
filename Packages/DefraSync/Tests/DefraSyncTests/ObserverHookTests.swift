@@ -2,17 +2,16 @@ import XCTest
 @testable import DefraSync
 import WhoopStore
 
-/// Validates that the WhoopStoreObserver hook fires on each `upsert*` and that
-/// `SyncContext.applyingFromDefra` suppresses re-publishing (the load-bearing loop-prevention
-/// behavior). Uses an in-memory store and a recording observer — no DefraDB sidecar.
+/// Validates that the `WhoopStoreObserver` hook fires on each `upsert*` by default, and that
+/// passing `skipObserver: true` (the inbound-apply path used by `DefraSubscriber`) suppresses
+/// the notification — the load-bearing loop-prevention behavior. Uses an in-memory store and
+/// a recording observer — no DefraDB needed.
 final class ObserverHookTests: XCTestCase {
 
     actor Recorder: WhoopStoreObserver {
         var calls: [(collection: String, deviceId: String, count: Int)] = []
-        var sawApplyingFromDefra: Bool = false
 
         func didUpsert(collection: String, deviceId: String, payloadsJSON: [String]) async {
-            sawApplyingFromDefra = sawApplyingFromDefra || SyncContext.applyingFromDefra
             calls.append((collection, deviceId, payloadsJSON.count))
         }
     }
@@ -54,24 +53,38 @@ final class ObserverHookTests: XCTestCase {
         XCTAssertTrue(calls.allSatisfy { $0.count >= 1 })
     }
 
-    func test_applyingFromDefra_propagates_into_observer() async throws {
+    func test_skipObserver_suppresses_notification() async throws {
         let store = try await WhoopStore.inMemory()
         let rec = Recorder()
         await store.setObserver(rec)
 
-        // Wrap the upsert in the inbound-apply flag, exactly like DefraSubscriber does.
-        await SyncContext.$applyingFromDefra.withValue(true) {
-            _ = try? await store.upsertDailyMetrics([
-                DailyMetric(day: "2026-06-07", totalSleepMin: nil, efficiency: nil,
-                            deepMin: nil, remMin: nil, lightMin: nil,
-                            disturbances: nil, restingHr: nil, avgHrv: nil,
-                            recovery: nil, strain: nil, exerciseCount: nil)
-            ], deviceId: "x")
-        }
+        // Mirror DefraSubscriber.apply: every inbound-apply call passes skipObserver: true.
+        try await store.upsertSleepSessions([
+            CachedSleepSession(startTs: 1, endTs: 2, efficiency: nil,
+                                restingHr: nil, avgHrv: nil, stagesJSON: nil)
+        ], deviceId: "x", skipObserver: true)
+        try await store.upsertDailyMetrics([
+            DailyMetric(day: "2026-06-07", totalSleepMin: nil, efficiency: nil,
+                        deepMin: nil, remMin: nil, lightMin: nil,
+                        disturbances: nil, restingHr: nil, avgHrv: nil,
+                        recovery: nil, strain: nil, exerciseCount: nil)
+        ], deviceId: "x", skipObserver: true)
+        try await store.upsertJournal([
+            JournalEntry(day: "2026-06-07", question: "Q", answeredYes: true, notes: nil)
+        ], deviceId: "x", skipObserver: true)
+        try await store.upsertWorkouts([
+            WorkoutRow(startTs: 1, endTs: 2, sport: "S", source: "src",
+                       durationS: nil, energyKcal: nil, avgHr: nil, maxHr: nil,
+                       strain: nil, distanceM: nil, zonesJSON: nil, notes: nil)
+        ], deviceId: "x", skipObserver: true)
+        try await store.upsertAppleDaily([
+            AppleDaily(day: "2026-06-07", steps: 1, activeKcal: nil, basalKcal: nil,
+                       vo2max: nil, avgHr: nil, maxHr: nil, walkingHr: nil, weightKg: nil)
+        ], deviceId: "x", skipObserver: true)
 
         try await Task.sleep(nanoseconds: 200_000_000)
-        let saw = await rec.sawApplyingFromDefra
-        XCTAssertTrue(saw,
-                      "Observer must read SyncContext.applyingFromDefra == true so it can skip the re-publish")
+        let calls = await rec.calls
+        XCTAssertTrue(calls.isEmpty,
+                      "skipObserver: true must NOT fire the observer (loop prevention)")
     }
 }

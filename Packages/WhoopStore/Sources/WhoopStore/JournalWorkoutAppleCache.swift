@@ -68,8 +68,10 @@ extension WhoopStore {
     // MARK: - Upserts (idempotent by natural key; latest value wins on conflict)
 
     /// Upsert journal entries. Natural key (deviceId, day, question). Returns rows changed.
+    /// `skipObserver` mirrors the flag on `upsertSleepSessions` — used by the DefraDB inbound
+    /// apply path to avoid re-publishing rows that came in over the network.
     @discardableResult
-    public func upsertJournal(_ rows: [JournalEntry], deviceId: String) async throws -> Int {
+    public func upsertJournal(_ rows: [JournalEntry], deviceId: String, skipObserver: Bool = false) async throws -> Int {
         let n = try syncWrite { db in
             var n = 0
             for r in rows {
@@ -85,19 +87,21 @@ extension WhoopStore {
             }
             return n
         }
-        notifyObserver(
-            collection: "journal",
-            deviceId: deviceId,
-            payloadsJSON: ObserverPayload.encodeAll(rows.map { r in
-                [
-                    "deviceId": deviceId,
-                    "day": r.day,
-                    "question": r.question,
-                    "answeredYes": r.answeredYes,
-                    "notes": r.notes,
-                ]
-            })
-        )
+        if !skipObserver {
+            notifyObserver(
+                collection: "journal",
+                deviceId: deviceId,
+                payloadsJSON: ObserverPayload.encodeAll(rows.map { r in
+                    [
+                        "deviceId": deviceId,
+                        "day": r.day,
+                        "question": r.question,
+                        "answeredYes": r.answeredYes,
+                        "notes": r.notes,
+                    ]
+                })
+            )
+        }
         return n
     }
 
@@ -115,8 +119,9 @@ extension WhoopStore {
     }
 
     /// Upsert workouts. Natural key (deviceId, startTs, sport). Returns rows changed.
+    /// See `upsertSleepSessions` for the `skipObserver` semantics.
     @discardableResult
-    public func upsertWorkouts(_ rows: [WorkoutRow], deviceId: String) async throws -> Int {
+    public func upsertWorkouts(_ rows: [WorkoutRow], deviceId: String, skipObserver: Bool = false) async throws -> Int {
         let n = try syncWrite { db in
             var n = 0
             for r in rows {
@@ -143,27 +148,29 @@ extension WhoopStore {
             }
             return n
         }
-        notifyObserver(
-            collection: "workout",
-            deviceId: deviceId,
-            payloadsJSON: ObserverPayload.encodeAll(rows.map { r in
-                [
-                    "deviceId": deviceId,
-                    "startTs": r.startTs,
-                    "endTs": r.endTs,
-                    "sport": r.sport,
-                    "source": r.source,
-                    "durationS": r.durationS,
-                    "energyKcal": r.energyKcal,
-                    "avgHr": r.avgHr,
-                    "maxHr": r.maxHr,
-                    "strain": r.strain,
-                    "distanceM": r.distanceM,
-                    "zonesJSON": r.zonesJSON,
-                    "notes": r.notes,
-                ]
-            })
-        )
+        if !skipObserver {
+            notifyObserver(
+                collection: "workout",
+                deviceId: deviceId,
+                payloadsJSON: ObserverPayload.encodeAll(rows.map { r in
+                    [
+                        "deviceId": deviceId,
+                        "startTs": r.startTs,
+                        "endTs": r.endTs,
+                        "sport": r.sport,
+                        "source": r.source,
+                        "durationS": r.durationS,
+                        "energyKcal": r.energyKcal,
+                        "avgHr": r.avgHr,
+                        "maxHr": r.maxHr,
+                        "strain": r.strain,
+                        "distanceM": r.distanceM,
+                        "zonesJSON": r.zonesJSON,
+                        "notes": r.notes,
+                    ]
+                })
+            )
+        }
         return n
     }
 
@@ -182,8 +189,9 @@ extension WhoopStore {
     }
 
     /// Upsert Apple-Health daily aggregates. Natural key (deviceId, day). Returns rows changed.
+    /// See `upsertSleepSessions` for the `skipObserver` semantics.
     @discardableResult
-    public func upsertAppleDaily(_ rows: [AppleDaily], deviceId: String) async throws -> Int {
+    public func upsertAppleDaily(_ rows: [AppleDaily], deviceId: String, skipObserver: Bool = false) async throws -> Int {
         let n = try syncWrite { db in
             var n = 0
             for r in rows {
@@ -207,24 +215,26 @@ extension WhoopStore {
             }
             return n
         }
-        notifyObserver(
-            collection: "appleDaily",
-            deviceId: deviceId,
-            payloadsJSON: ObserverPayload.encodeAll(rows.map { r in
-                [
-                    "deviceId": deviceId,
-                    "day": r.day,
-                    "steps": r.steps,
-                    "activeKcal": r.activeKcal,
-                    "basalKcal": r.basalKcal,
-                    "vo2max": r.vo2max,
-                    "avgHr": r.avgHr,
-                    "maxHr": r.maxHr,
-                    "walkingHr": r.walkingHr,
-                    "weightKg": r.weightKg,
-                ]
-            })
-        )
+        if !skipObserver {
+            notifyObserver(
+                collection: "appleDaily",
+                deviceId: deviceId,
+                payloadsJSON: ObserverPayload.encodeAll(rows.map { r in
+                    [
+                        "deviceId": deviceId,
+                        "day": r.day,
+                        "steps": r.steps,
+                        "activeKcal": r.activeKcal,
+                        "basalKcal": r.basalKcal,
+                        "vo2max": r.vo2max,
+                        "avgHr": r.avgHr,
+                        "maxHr": r.maxHr,
+                        "walkingHr": r.walkingHr,
+                        "weightKg": r.weightKg,
+                    ]
+                })
+            )
+        }
         return n
     }
 

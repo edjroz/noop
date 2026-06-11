@@ -1,9 +1,9 @@
 import Foundation
 import WhoopStore
 
-/// Inbound apply: subscribes to each DefraDB collection (graphql-ws over WebSocket) and applies
-/// inbound rows through `WhoopStore.upsert*`, wrapped in `SyncContext.applyingFromDefra = true`
-/// so the outbound mirror suppresses the round-trip.
+/// Inbound apply: polls each DefraDB collection on a 30s loop and applies inbound rows through
+/// `WhoopStore.upsert*` with `skipObserver: true` — so the outbound mirror (`DefraSyncer`) is
+/// never asked to publish a row that just arrived from the network.
 ///
 /// **Alpha caveats:** DefraDB subscriptions are not battle-tested. This subscriber:
 /// - Reconnects on socket failure with exponential backoff.
@@ -87,15 +87,19 @@ public actor DefraSubscriber {
             byDevice[dev, default: []].append(row)
         }
         for (deviceId, group) in byDevice {
-            await SyncContext.$applyingFromDefra.withValue(true) {
-                await apply(collection: collection, deviceId: deviceId, rows: group)
-            }
+            await apply(collection: collection, deviceId: deviceId, rows: group)
         }
         highWater[collection] = newest
     }
 
     // MARK: - Per-collection apply via existing WhoopStore upserts
 
+    /// Apply inbound rows to the local SQLite store. Every upsert call below passes
+    /// `skipObserver: true` so the row, which by definition just came in over the network,
+    /// is NOT re-fed into `DefraSyncer` and bounced back out. This replaces the previous
+    /// `@TaskLocal applyingFromDefra` guard whose propagation across actor boundaries and
+    /// `Task { }` initializers proved unreliable in practice (#…) — the explicit parameter
+    /// can't leak across calls and makes the design intent obvious at the call site.
     private func apply(collection: String, deviceId: String, rows: [[String: Any]]) async {
         switch collection {
         case "sleepSession":
@@ -108,7 +112,7 @@ public actor DefraSubscriber {
                     avgHrv: r["avgHrv"] as? Double,
                     stagesJSON: r["stagesJSON"] as? String)
             }
-            _ = try? await store.upsertSleepSessions(mapped, deviceId: deviceId)
+            _ = try? await store.upsertSleepSessions(mapped, deviceId: deviceId, skipObserver: true)
         case "dailyMetric":
             let mapped = rows.compactMap { r -> DailyMetric? in
                 guard let day = r["day"] as? String else { return nil }
@@ -131,14 +135,14 @@ public actor DefraSubscriber {
                     steps: r["steps"] as? Int,
                     activeKcalEst: r["activeKcalEst"] as? Double)
             }
-            _ = try? await store.upsertDailyMetrics(mapped, deviceId: deviceId)
+            _ = try? await store.upsertDailyMetrics(mapped, deviceId: deviceId, skipObserver: true)
         case "journal":
             let mapped = rows.compactMap { r -> JournalEntry? in
                 guard let day = r["day"] as? String, let q = r["question"] as? String,
                       let yes = r["answeredYes"] as? Bool else { return nil }
                 return JournalEntry(day: day, question: q, answeredYes: yes, notes: r["notes"] as? String)
             }
-            _ = try? await store.upsertJournal(mapped, deviceId: deviceId)
+            _ = try? await store.upsertJournal(mapped, deviceId: deviceId, skipObserver: true)
         case "workout":
             let mapped = rows.compactMap { r -> WorkoutRow? in
                 guard let s = r["startTs"] as? Int, let e = r["endTs"] as? Int,
@@ -154,7 +158,7 @@ public actor DefraSubscriber {
                     zonesJSON: r["zonesJSON"] as? String,
                     notes: r["notes"] as? String)
             }
-            _ = try? await store.upsertWorkouts(mapped, deviceId: deviceId)
+            _ = try? await store.upsertWorkouts(mapped, deviceId: deviceId, skipObserver: true)
         case "appleDaily":
             let mapped = rows.compactMap { r -> AppleDaily? in
                 guard let day = r["day"] as? String else { return nil }
@@ -169,7 +173,7 @@ public actor DefraSubscriber {
                     walkingHr: r["walkingHr"] as? Int,
                     weightKg: r["weightKg"] as? Double)
             }
-            _ = try? await store.upsertAppleDaily(mapped, deviceId: deviceId)
+            _ = try? await store.upsertAppleDaily(mapped, deviceId: deviceId, skipObserver: true)
         default:
             return
         }

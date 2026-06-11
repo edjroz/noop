@@ -67,8 +67,13 @@ extension WhoopStore {
     // MARK: - Upserts (idempotent by natural key; latest server value wins on conflict)
 
     /// Upsert cached sleep sessions. Natural key (deviceId, startTs). Returns rows changed.
+    ///
+    /// `skipObserver` is opt-in suppression of the `WhoopStoreObserver` notification for the
+    /// caller that already represents "data arriving from the network" — the DefraDB inbound
+    /// apply path. Default `false` keeps every other caller (BLE collector, importers, the mock
+    /// seeder, the SyncController backfill loop) firing the observer.
     @discardableResult
-    public func upsertSleepSessions(_ sessions: [CachedSleepSession], deviceId: String) async throws -> Int {
+    public func upsertSleepSessions(_ sessions: [CachedSleepSession], deviceId: String, skipObserver: Bool = false) async throws -> Int {
         let n = try syncWrite { db in
             var n = 0
             for s in sessions {
@@ -88,27 +93,30 @@ extension WhoopStore {
             }
             return n
         }
-        notifyObserver(
-            collection: "sleepSession",
-            deviceId: deviceId,
-            payloadsJSON: ObserverPayload.encodeAll(sessions.map { s in
-                [
-                    "deviceId": deviceId,
-                    "startTs": s.startTs,
-                    "endTs": s.endTs,
-                    "efficiency": s.efficiency,
-                    "restingHr": s.restingHr,
-                    "avgHrv": s.avgHrv,
-                    "stagesJSON": s.stagesJSON,
-                ]
-            })
-        )
+        if !skipObserver {
+            notifyObserver(
+                collection: "sleepSession",
+                deviceId: deviceId,
+                payloadsJSON: ObserverPayload.encodeAll(sessions.map { s in
+                    [
+                        "deviceId": deviceId,
+                        "startTs": s.startTs,
+                        "endTs": s.endTs,
+                        "efficiency": s.efficiency,
+                        "restingHr": s.restingHr,
+                        "avgHrv": s.avgHrv,
+                        "stagesJSON": s.stagesJSON,
+                    ]
+                })
+            )
+        }
         return n
     }
 
     /// Upsert cached daily metrics. Natural key (deviceId, day). Returns rows changed.
+    /// See `upsertSleepSessions` for the `skipObserver` semantics.
     @discardableResult
-    public func upsertDailyMetrics(_ days: [DailyMetric], deviceId: String) async throws -> Int {
+    public func upsertDailyMetrics(_ days: [DailyMetric], deviceId: String, skipObserver: Bool = false) async throws -> Int {
         let n = try syncWrite { db in
             var n = 0
             for d in days {
@@ -144,32 +152,34 @@ extension WhoopStore {
             }
             return n
         }
-        notifyObserver(
-            collection: "dailyMetric",
-            deviceId: deviceId,
-            payloadsJSON: ObserverPayload.encodeAll(days.map { d in
-                [
-                    "deviceId": deviceId,
-                    "day": d.day,
-                    "totalSleepMin": d.totalSleepMin,
-                    "efficiency": d.efficiency,
-                    "deepMin": d.deepMin,
-                    "remMin": d.remMin,
-                    "lightMin": d.lightMin,
-                    "disturbances": d.disturbances,
-                    "restingHr": d.restingHr,
-                    "avgHrv": d.avgHrv,
-                    "recovery": d.recovery,
-                    "strain": d.strain,
-                    "exerciseCount": d.exerciseCount,
-                    "spo2Pct": d.spo2Pct,
-                    "skinTempDevC": d.skinTempDevC,
-                    "respRateBpm": d.respRateBpm,
-                    "steps": d.steps,
-                    "activeKcalEst": d.activeKcalEst,
-                ]
-            })
-        )
+        if !skipObserver {
+            notifyObserver(
+                collection: "dailyMetric",
+                deviceId: deviceId,
+                payloadsJSON: ObserverPayload.encodeAll(days.map { d in
+                    [
+                        "deviceId": deviceId,
+                        "day": d.day,
+                        "totalSleepMin": d.totalSleepMin,
+                        "efficiency": d.efficiency,
+                        "deepMin": d.deepMin,
+                        "remMin": d.remMin,
+                        "lightMin": d.lightMin,
+                        "disturbances": d.disturbances,
+                        "restingHr": d.restingHr,
+                        "avgHrv": d.avgHrv,
+                        "recovery": d.recovery,
+                        "strain": d.strain,
+                        "exerciseCount": d.exerciseCount,
+                        "spo2Pct": d.spo2Pct,
+                        "skinTempDevC": d.skinTempDevC,
+                        "respRateBpm": d.respRateBpm,
+                        "steps": d.steps,
+                        "activeKcalEst": d.activeKcalEst,
+                    ]
+                })
+            )
+        }
         return n
     }
 
