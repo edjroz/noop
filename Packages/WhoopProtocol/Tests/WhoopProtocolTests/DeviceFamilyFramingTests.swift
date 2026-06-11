@@ -172,4 +172,117 @@ final class DeviceFamilyFramingTests: XCTestCase {
         let frame = Self.hex("aa1800ff28020f3de10128663c0000000000000000000000da855212")
         XCTAssertEqual(parseFrame(frame, family: .whoop4), parseFrame(frame))
     }
+
+    // MARK: - Family-aware Reassembler
+
+    func testReassemblerWhoop5SingleFrame() {
+        // validWhoop5 is a complete 20-byte frame: declLength=12 @ [2..4] -> total = 12 + 8 = 20.
+        let frame = Self.hex(Self.validWhoop5)
+        let r = Reassembler(family: .whoop5)
+        let out = r.feed(frame)
+        XCTAssertEqual(out.count, 1)
+        XCTAssertEqual(out.first, frame)
+    }
+
+    func testReassemblerWhoop5SplitAcrossFragments() {
+        // A whoop5 frame split mid-way must only emit once both halves have arrived.
+        let frame = Self.hex(Self.validWhoop5)
+        let r = Reassembler(family: .whoop5)
+        XCTAssertEqual(r.feed(Array(frame[0..<9])).count, 0)   // incomplete so far
+        let out = r.feed(Array(frame[9...]))                   // rest arrives
+        XCTAssertEqual(out.count, 1)
+        XCTAssertEqual(out.first, frame)
+    }
+
+    func testReassemblerWhoop5BackToBackFrames() {
+        // Two whoop5 frames in one buffer (the 16-byte CLIENT_HELLO then the 20-byte fixture).
+        let hello = DeviceFamily.whoop5ClientHello     // declLength=8 -> total 16
+        let frame = Self.hex(Self.validWhoop5)          // total 20
+        let r = Reassembler(family: .whoop5)
+        let out = r.feed(hello + frame)
+        XCTAssertEqual(out.count, 2)
+        XCTAssertEqual(out[0], hello)
+        XCTAssertEqual(out[1], frame)
+    }
+
+    func testReassemblerWhoop5DiscardsLeadingGarbage() {
+        let frame = Self.hex(Self.validWhoop5)
+        let r = Reassembler(family: .whoop5)
+        let out = r.feed([0x00, 0xFF, 0x12] + frame)   // junk before the 0xAA SOF
+        XCTAssertEqual(out.count, 1)
+        XCTAssertEqual(out.first, frame)
+    }
+
+    // MARK: - Puffin command frame builder (experimental 5/MG outbound)
+
+    func testPuffinCommandFrameVerifies() {
+        // A puffin TOGGLE_REALTIME_HR (cmd 3, payload [0x01]) must be a well-formed whoop5 frame.
+        let f = puffinCommandFrame(cmd: 3, seq: 7, payload: [0x01])
+        let check = verifyFrame(f, family: .whoop5)
+        XCTAssertTrue(check.ok)
+        XCTAssertEqual(check.crc8OK, true)    // CRC16 header outcome surfaced via crc8OK
+        XCTAssertEqual(check.crc32OK, true)
+        // And it parses back as a whoop5 frame with the seq we set.
+        let parsed = parseFrame(f, family: .whoop5)
+        XCTAssertTrue(parsed.ok)
+        XCTAssertEqual(parsed.seq, 7)
+        // It also reassembles cleanly through the whoop5 reassembler.
+        XCTAssertEqual(Reassembler(family: .whoop5).feed(f), [f])
+    }
+
+    func testReassemblerWhoop4DefaultUnchanged() {
+        // Default family stays WHOOP 4.0: a 28-byte whoop4 frame (length=0x18=24 -> total 28).
+        let frame = Self.hex("aa1800ff28020f3de10128663c0000000000000000000000da855212")
+        XCTAssertEqual(Reassembler().feed(frame), [frame])
+        XCTAssertEqual(Reassembler(family: .whoop4).feed(frame), [frame])
+    }
+
+    func testPuffinHapticsFrameMatchesMaverickGolden() {
+        // WHOOP 5/MG buzz (#48): the haptic inner is 15 bytes ([35, seq, 0x13] + 12-byte payload), which
+        // pad4 must extend to 16 before length/CRC — exactly as the strap's maverick framing does. The
+        // golden frame is computed from the working app's buildMaverickFrame (notify preset, effects
+        // 47,152) at seq=1; byte-for-byte equality proves our opcode (0x13), payload, AND pad4 are correct.
+        let payload: [UInt8] = [0x01, 47, 152, 0, 0, 0, 0, 0, 0, 0, 0, 0]   // 0x01 + effects(8) + loopCtl(2) + overallLoop
+        XCTAssertEqual(payload.count, 12)
+        let frame = puffinCommandFrame(cmd: 0x13, seq: 1, payload: payload)
+        XCTAssertEqual(frame, Self.hex("aa0114000001e1e1230113012f980000000000000000000098cb83a5"))
+        XCTAssertEqual(frame.count, 28)            // 8 header + 16 padded inner + 4 crc32
+        XCTAssertTrue(verifyFrame(frame, family: .whoop5).ok)
+        XCTAssertEqual(Reassembler(family: .whoop5).feed(frame), [frame])
+        // pad4 is a NO-OP for already-4-aligned commands: HR toggle inner ([35, seq, 3, 1]) stays 16 bytes.
+        XCTAssertEqual(puffinCommandFrame(cmd: 3, seq: 7, payload: [0x01]).count, 16)
+    }
+
+    // MARK: - 5/MG firmware-alarm payloads (REVISION_4 / REVISION_2) — Swift twin of AlarmPayloadTest.kt
+
+    func testMaverickAlarmPayloadBytes() {
+        // wakeEpochMs 1_700_000_000_123 → seconds 1700000000 (LE 00 f1 53 65),
+        // subseconds (123*32768)/1000 = 4030 = 0x0FBE (LE be 0f); tail = effects 47/152,
+        // loopControl 0, overallLoop 7, duration 30 s. Byte-for-byte the Android vectors.
+        let body = AlarmPayload.setAlarmRev4(wakeEpochMs: 1_700_000_000_123)
+        XCTAssertEqual(body.count, 20)
+        XCTAssertEqual(body, Self.hex("040100f15365be0f2f980000000000000000071e"))
+        XCTAssertEqual(AlarmPayload.disableRev2(), [0x02, 0xFF])
+        XCTAssertEqual(AlarmPayload.runAlarmRev2(), [0x02, 0x01])
+        XCTAssertEqual(MaverickHaptics.notificationBuzz(loops: 1),
+                       [0x01, 47, 152, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        XCTAssertEqual(MaverickHaptics.notificationBuzz(loops: 999).last, 255)   // clamped
+    }
+
+    func testPuffinAlarmFramesMatchKotlinParityGoldens() {
+        // Cross-platform parity pins: the Android FramingTest asserts these SAME three full-frame
+        // hexes, so both platforms are locked to identical alarm bytes (the same pipeline whose
+        // buzz output is capture-verified above). SET_ALARM_TIME inner is 23 bytes → pad4 → 24,
+        // declLen 28; the rev-2 bodies pad 5 → 8.
+        let alarm = puffinCommandFrame(cmd: 66, seq: 1,
+                                       payload: AlarmPayload.setAlarmRev4(wakeEpochMs: 1_700_000_000_123))
+        XCTAssertEqual(alarm, Self.hex("aa011c000001e381230142040100f15365be0f2f980000000000000000071e00392f2ac9"))
+        XCTAssertEqual(alarm.count, 36)
+        XCTAssertTrue(verifyFrame(alarm, family: .whoop5).ok)
+        XCTAssertEqual(Reassembler(family: .whoop5).feed(alarm), [alarm])
+        XCTAssertEqual(puffinCommandFrame(cmd: 69, seq: 1, payload: AlarmPayload.disableRev2()),
+                       Self.hex("aa010c000001e74123014502ff000000267ffc4f"))
+        XCTAssertEqual(puffinCommandFrame(cmd: 68, seq: 1, payload: AlarmPayload.runAlarmRev2()),
+                       Self.hex("aa010c000001e741230144020100000017cd19e2"))
+    }
 }

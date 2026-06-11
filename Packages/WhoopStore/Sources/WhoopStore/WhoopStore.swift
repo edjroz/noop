@@ -5,8 +5,9 @@ import WhoopProtocol
 /// OpenWhoop persistence library — decoded streams are durable; raw frames are a
 /// transient, compressed, prunable outbox. Built on GRDB/SQLite.
 public enum WhoopStoreInfo {
-    /// Bumped whenever the migrator gains a new migration.
-    public static let schemaVersion = 10
+    /// Bumped whenever the migrator gains a new migration. Upstream is at 11 (v10 stepSample +
+    /// v11 daily-steps/calorie cols). The DefraSync fork adds v12 (defra_outbox).
+    public static let schemaVersion = 12
 }
 
 /// Observer hook invoked after a successful upsert into one of the synced metric-cache tables.

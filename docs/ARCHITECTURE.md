@@ -7,7 +7,7 @@ the app interoperates with **your own device and your own data**. It can also im
 own: WHOOP CSV exports and Apple Health exports.
 
 > **Not affiliated with WHOOP.** NOOP is an independent, interoperability project built on
-> open-source reverse-engineering of the strap's Bluetooth protocol. It is **not a medical device**
+> community reverse-engineering of the strap's Bluetooth protocol. It is **not a medical device**
 > and produces **approximate** physiological estimates that must not be used for diagnosis or
 > treatment. See [`DISCLAIMER.md`](../DISCLAIMER.md) and [`ATTRIBUTION.md`](../ATTRIBUTION.md).
 
@@ -389,7 +389,7 @@ computed locally.
 
 ## Attribution
 
-NOOP's BLE protocol work builds on open-source reverse-engineering of the WHOOP straps:
+NOOP's BLE protocol work builds on community reverse-engineering of the WHOOP straps:
 
 - **johnmiddleton12/my-whoop** — WHOOP 4.0 protocol.
 - **b-nnett/goose** — WHOOP 5.0 protocol.

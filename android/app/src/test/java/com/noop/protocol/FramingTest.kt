@@ -66,6 +66,87 @@ class FramingTest {
         assertEquals(wantCrc32, gotCrc32)
     }
 
+    // MARK: - puffinCommandFrame (EXPERIMENTAL WHOOP 5.0/MG)
+
+    @Test
+    fun puffinCommandFrame_roundTripsThroughWhoop5Parse() {
+        // EXPERIMENTAL: a puffin TOGGLE_REALTIME_HR(3) probe, payload [1], seq 7. The CRC16 header +
+        // CRC32 payload must both verify when parsed as a WHOOP5 frame (parseWhoop5 reports crcOk).
+        val frame = Framing.puffinCommandFrame(
+            cmd = CommandNumber.TOGGLE_REALTIME_HR.rawValue,
+            seq = 7,
+            payload = byteArrayOf(1),
+        )
+        val r = Framing.parseFrame(frame, DeviceFamily.WHOOP5)
+        assertTrue(r.ok)
+        assertEquals(true, r.crcOk)
+        // Inner record starts at offset 8: [type=35][seq=7][cmd=3][payload=1].
+        assertEquals(PacketType.COMMAND.rawValue, frame[8].toInt() and 0xFF)
+        assertEquals(7, frame[9].toInt() and 0xFF)
+        assertEquals(CommandNumber.TOGGLE_REALTIME_HR.rawValue, frame[10].toInt() and 0xFF)
+        assertEquals(1, frame[11].toInt() and 0xFF)
+    }
+
+    @Test
+    fun puffinCommandFrame_envelopeShapeAndCrcsAreSelfConsistent() {
+        val frame = Framing.puffinCommandFrame(
+            cmd = CommandNumber.TOGGLE_REALTIME_HR.rawValue,
+            seq = 1,
+            payload = byteArrayOf(1),
+        )
+        // SOF 0xAA, format byte 0x01.
+        assertEquals(0xAA.toByte(), frame[0])
+        assertEquals(0x01.toByte(), frame[1])
+        // declaredLength = inner(3+1=4) + 4 = 8; total frame = declaredLength + 8.
+        val declLen = (frame[2].toInt() and 0xFF) or ((frame[3].toInt() and 0xFF) shl 8)
+        assertEquals(8, declLen)
+        assertEquals(declLen + 8, frame.size)
+        // CRC16-Modbus over frame[0..6) is stored LE at frame[6..8).
+        val wantHeader = Crc.crc16Modbus(frame.copyOfRange(0, 6))
+        val gotHeader = (frame[6].toInt() and 0xFF) or ((frame[7].toInt() and 0xFF) shl 8)
+        assertEquals(wantHeader, gotHeader)
+        // CRC32 over the inner record frame[8 until total-4) is stored LE in the last 4 bytes.
+        val payloadEnd = frame.size - 4
+        val inner = frame.copyOfRange(8, payloadEnd)
+        val wantCrc32 = Crc.crc32(inner)
+        val gotCrc32 = (frame[payloadEnd].toLong() and 0xFFL) or
+            ((frame[payloadEnd + 1].toLong() and 0xFFL) shl 8) or
+            ((frame[payloadEnd + 2].toLong() and 0xFFL) shl 16) or
+            ((frame[payloadEnd + 3].toLong() and 0xFFL) shl 24)
+        assertEquals(wantCrc32, gotCrc32)
+    }
+
+    @Test
+    fun puffinCommandFrame_hapticsMatchesMaverickGolden() {
+        // WHOOP 5/MG buzz (#48): haptic inner is 15 bytes ([35, seq, 0x13] + 12-byte payload), which
+        // pad4 must extend to 16 before length/CRC — like the strap's maverick framing. Golden frame
+        // from the working app's buildMaverickFrame (notify preset, effects 47,152) at seq=1; exact
+        // equality proves the opcode (0x13), payload, AND pad4 are all correct, byte-for-byte.
+        val payload = byteArrayOf(0x01, 47, 152.toByte(), 0, 0, 0, 0, 0, 0, 0, 0, 0) // 0x01+effects(8)+loopCtl(2)+overall
+        assertEquals(12, payload.size)
+        val frame = Framing.puffinCommandFrame(cmd = 0x13, seq = 1, payload = payload)
+        assertEquals("aa0114000001e1e1230113012f980000000000000000000098cb83a5", hex(frame))
+        assertEquals(28, frame.size) // 8 header + 16 padded inner + 4 crc32
+        assertTrue(Framing.parseFrame(frame, DeviceFamily.WHOOP5).ok)
+        // pad4 is a NO-OP for already-4-aligned commands: HR toggle inner ([35,seq,3,1]) stays 16 bytes.
+        assertEquals(16, Framing.puffinCommandFrame(cmd = CommandNumber.TOGGLE_REALTIME_HR.rawValue, seq = 7, payload = byteArrayOf(1)).size)
+    }
+
+    @Test
+    fun puffinCommandFrame_alarmFramesMatchSwiftParityGoldens() {
+        // Cross-platform parity pins: the macOS port (DeviceFamilyFramingTests) asserts these SAME
+        // three full-frame hexes, so both platforms are locked to identical alarm bytes. The
+        // SET_ALARM_TIME inner is 23 bytes → pad4 → 24 (declLen 28); the rev-2 bodies pad 5 → 8.
+        // (RUN_ALARM rev2 [0x02, alarmId] is built inline — the Kotlin client no longer ships a
+        // helper for it, but the Mac test-buzz path still sends it, so the bytes stay pinned here.)
+        val alarm = Framing.puffinCommandFrame(cmd = 66, seq = 1, payload = AlarmPayload.build(1_700_000_000_123L))
+        assertEquals("aa011c000001e381230142040100f15365be0f2f980000000000000000071e00392f2ac9", hex(alarm))
+        assertEquals("aa010c000001e74123014502ff000000267ffc4f",
+            hex(Framing.puffinCommandFrame(cmd = 69, seq = 1, payload = AlarmPayload.disableRev2())))
+        assertEquals("aa010c000001e741230144020100000017cd19e2",
+            hex(Framing.puffinCommandFrame(cmd = 68, seq = 1, payload = byteArrayOf(0x02, 0x01))))
+    }
+
     // MARK: - parseFrame decode vectors
 
     @Test
@@ -101,6 +182,23 @@ class FramingTest {
         assertEquals(87.5, r.parsed["battery_pct"] as Double, 1e-9)
         assertEquals(4012, r.parsed["battery_mV"])
         assertEquals(1, r.parsed["battery_charging"])
+    }
+
+    @Test
+    fun parse_eventBatteryLevel_notCharging() {
+        // Same synthetic BATTERY_LEVEL vector with the charge byte @26 = 0 (and the CRC32 trailer
+        // recomputed over the same type..payload region). Pins the decoder's bit in BOTH states so
+        // a charging consumer can trust 0 as "not charging", not "field missing".
+        val frame = bytes(
+            0xaa, 0x1b, 0x00, 0xc0, 0x30, 0x00, 0x03, 0x00, 0x32, 0xf1, 0x53, 0x65,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x6b, 0x03, 0x00, 0x00, 0xac, 0x0f, 0x00,
+            0x00, 0x00, 0x00, 0x2e, 0xd1, 0x9b, 0x65,
+        )
+        val r = Framing.parseFrame(frame)
+        assertTrue(r.ok)
+        assertEquals(true, r.crcOk)
+        assertEquals("BATTERY_LEVEL(3)", r.parsed["event"])
+        assertEquals(0, r.parsed["battery_charging"])
     }
 
     @Test
@@ -190,6 +288,34 @@ class FramingTest {
         assertArrayEquals(frame, out[0])
     }
 
+    @Test
+    fun reassembler_garbageLengthDoesNotStall_resyncsToNextFrame() {
+        // A misaligned/corrupt SOF with an impossibly large declared length (0xFFFF -> 65539 bytes)
+        // must NOT wedge the stream waiting for bytes that can never arrive over BLE. The reassembler
+        // should drop the bad SOF and recover the real frame that follows. (This is the live-HR-freeze
+        // failure mode: without the guard, every later frame — including HR — is silently dropped.)
+        val good = Framing.buildCommand(CommandNumber.GET_BATTERY_LEVEL, byteArrayOf(0), seq = 0)
+        val garbage = byteArrayOf(0xAA.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0x00)
+        val r = Reassembler()
+        val out = r.feed(garbage + good)
+        assertEquals(1, out.size)
+        assertArrayEquals(good, out[0])
+    }
+
+    @Test
+    fun reassembler_resetDropsPartialFrame() {
+        // reset() (called on every reconnect) must discard a buffered half-frame, so the stale bytes
+        // can't corrupt the first frame of the next session.
+        val frame = Framing.buildCommand(CommandNumber.GET_BATTERY_LEVEL, byteArrayOf(0), seq = 0)
+        val r = Reassembler()
+        val cut = frame.size / 2
+        assertTrue(r.feed(frame.copyOfRange(0, cut)).isEmpty())
+        r.reset()
+        val out = r.feed(frame)
+        assertEquals(1, out.size)
+        assertArrayEquals(frame, out[0])
+    }
+
     // MARK: - enum fromRaw
 
     @Test
@@ -218,5 +344,96 @@ class FramingTest {
         assertEquals(2, streams.rr.size)
         assertEquals(RrInterval(ts = 1700000000, rrMs = 850), streams.rr[0])
         assertEquals(RrInterval(ts = 1700000000, rrMs = 870), streams.rr[1])
+    }
+
+    // MARK: - WHOOP 5.0/MG REALTIME_DATA (+4) + family-aware reassembly
+
+    private fun fromHex(s: String): ByteArray =
+        ByteArray(s.length / 2) { ((s[it * 2].digitToInt(16) shl 4) or s[it * 2 + 1].digitToInt(16)).toByte() }
+
+    /** A real type-40 REALTIME_DATA frame from a worn WHOOP 5 (same vector as the Swift
+     *  Whoop5RealtimeTests): hr=98, rr=[603,587] ms, ts=1780916382. HR matched the 0x2A37 profile. */
+    private val whoop5RealtimeHex =
+        "aa011800010022e128029ea0266aae4762025b024b020000000001005ed515dc"
+
+    @Test
+    fun whoop5_realtimeData_decodesHrRrAtPlus4() {
+        val f = Framing.parseFrame(fromHex(whoop5RealtimeHex), DeviceFamily.WHOOP5)
+        assertTrue(f.ok)
+        assertEquals("REALTIME_DATA", f.typeName)
+        assertEquals(true, f.crcOk)
+        assertEquals(98, f.parsed["heart_rate"])          // 4.0 @12 → 5.0 @16
+        assertEquals(1780916382, f.parsed["timestamp"])   // 4.0 @6  → 5.0 @10
+        @Suppress("UNCHECKED_CAST")
+        assertEquals(listOf(603, 587), f.parsed["rr_intervals"] as List<Int>)
+    }
+
+    @Test
+    fun whoop5_reassembler_isFamilyAware() {
+        // The WHOOP4 length rule decodes a bogus ~6 KB length for a 5/MG frame and never emits; the
+        // family-aware reassembler frames it correctly (declLen @[2..4], total + 8).
+        val frame = fromHex(whoop5RealtimeHex)
+        val out = Reassembler(DeviceFamily.WHOOP5).feed(frame)
+        assertEquals(1, out.size)
+        assertArrayEquals(frame, out[0])
+        assertTrue(Reassembler(DeviceFamily.WHOOP4).feed(frame).isEmpty())
+    }
+
+    // MARK: - WHOOP 5/MG command + decode vectors (real-hardware captures, #78 fork)
+
+    @Test
+    fun puffinCommandFrame_historicalCommandsMatchGooseBytes() {
+        // CRC-pinned against frames a real WHOOP 5 acked (Goose-compatible). Our [0x00] default
+        // payload pads identically to an empty payload (pad4), so both forms produce these bytes.
+        val getRange = Framing.puffinCommandFrame(
+            cmd = CommandNumber.GET_DATA_RANGE.rawValue, seq = 1, payload = byteArrayOf(),
+        )
+        val sendHistorical = Framing.puffinCommandFrame(
+            cmd = CommandNumber.SEND_HISTORICAL_DATA.rawValue, seq = 2, payload = byteArrayOf(),
+        )
+        assertEquals("aa0108000001e67123012200dbf3b335", hex(getRange))
+        assertEquals("aa0108000001e6712302160075bedf8c", hex(sendHistorical))
+    }
+
+    @Test
+    fun whoop5_commandResponse_decodesAtPuffinOffsets() {
+        // Synthetic puffin COMMAND_RESPONSE round-trip: GET_DATA_RANGE, resp_seq=7, result=SUCCESS.
+        val frame = Framing.puffinCommandFrame(
+            cmd = CommandNumber.GET_DATA_RANGE.rawValue,
+            seq = 0,
+            payload = byteArrayOf(7, 1),
+            type = PacketType.COMMAND_RESPONSE.rawValue,
+        )
+        val parsed = Framing.parseFrame(frame, DeviceFamily.WHOOP5)
+        assertEquals("COMMAND_RESPONSE", parsed.typeName)
+        assertEquals("GET_DATA_RANGE(34)", parsed.parsed["resp_cmd"])
+        assertEquals(7, parsed.parsed["resp_seq"])
+        assertEquals("SUCCESS(1)", parsed.parsed["result"])
+    }
+
+    @Test
+    fun whoop5_event_decodesAtPlus4AndPreservesPayload() {
+        // Real 5/MG capture: uncatalogued event 0x1D(29) with a 16-byte payload — kept as hex so
+        // protocol research can classify it later.
+        val frame = fromHex("aa011c00010023d130c61d00e61ab7698a390c000e0000000000e8020b000100d2803585")
+        val parsed = Framing.parseFrame(frame, DeviceFamily.WHOOP5)
+        assertEquals("EVENT", parsed.typeName)
+        assertEquals(true, parsed.crcOk)
+        assertEquals("0x1D(29)", parsed.parsed["event"])
+        assertEquals(1773607654, parsed.parsed["event_timestamp"])
+        assertEquals("8a390c000e0000000000e8020b000100", parsed.parsed["event_payload_hex"])
+    }
+
+    @Test
+    fun whoop5_consoleLogs_extractsText() {
+        // Real 5/MG capture: the strap narrating its own history transfer. NUL-trimmed.
+        val frame = fromHex(
+            "aa014400010030b1329f02005319b769a93e340001486973746f726963616c20446174610a20" +
+                "35352c20323538313935393a20424c453a2068697374207472616e7366657220730039d91fe2",
+        )
+        val parsed = Framing.parseFrame(frame, DeviceFamily.WHOOP5)
+        assertEquals("CONSOLE_LOGS", parsed.typeName)
+        assertEquals(true, parsed.crcOk)
+        assertEquals("Historical Data\n 55, 2581959: BLE: hist transfer s", parsed.parsed["console"])
     }
 }

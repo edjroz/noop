@@ -68,7 +68,7 @@ fun SupportScreen() {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("Built on", style = NoopType.headline, color = Palette.textPrimary)
                 Text(
-                    "This stands on open-source reverse-engineering. Huge thanks:",
+                    "This stands on community reverse-engineering. Huge thanks:",
                     style = NoopType.subhead, color = Palette.textSecondary,
                 )
                 attributions.forEach { a ->

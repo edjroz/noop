@@ -126,6 +126,17 @@ extension WhoopStore {
                     grav += db.changesCount
                 }
             }
+            // WHOOP5 step counter (#78). Persist-only — the count is not surfaced in the return tuple
+            // (no consumer reads it; keeping the 8-field tuple avoids touching any caller/test).
+            if !streams.steps.isEmpty {
+                let stmt = try db.cachedStatement(sql: """
+                    INSERT INTO stepSample (deviceId, ts, counter) VALUES (?, ?, ?)
+                    ON CONFLICT(deviceId, ts) DO NOTHING
+                    """)
+                for s in streams.steps {
+                    try stmt.execute(arguments: [deviceId, s.ts, s.counter])
+                }
+            }
             return (hr, rr, ev, bat, spo2, skin, resp, grav)
         }
     }
@@ -135,9 +146,11 @@ extension WhoopStore {
     public func storageStats_rowCountsForTest() async throws
         -> (hr: Int, rr: Int, events: Int, battery: Int,
             spo2: Int, skinTemp: Int, resp: Int, gravity: Int) {
-        // Broken into explicit lets — the inline 8-tuple of `try`-expressions trips Swift's
-        // type-checker into a multi-second backtrack.
-        return try syncRead { db in
+        // Bind each count to its own `let` before assembling the tuple. Returning the whole tuple of
+        // inline `try Int.fetchOne(...) ?? 0` expressions made Swift's type-checker time out on some
+        // toolchains/machines (reported by a contributor building locally); splitting it is
+        // behaviour-identical and trivial to type-check.
+        try syncRead { db in
             let hr = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM hrSample") ?? 0
             let rr = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM rrInterval") ?? 0
             let events = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM event") ?? 0
@@ -146,9 +159,12 @@ extension WhoopStore {
             let skinTemp = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM skinTempSample") ?? 0
             let resp = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM respSample") ?? 0
             let gravity = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM gravitySample") ?? 0
-            return (hr: hr, rr: rr, events: events, battery: battery,
-                    spo2: spo2, skinTemp: skinTemp, resp: resp, gravity: gravity)
+            return (hr, rr, events, battery, spo2, skinTemp, resp, gravity)
         }
+    }
+
+    public func stepCountForTest() async throws -> Int {
+        try syncRead { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM stepSample") ?? 0 }
     }
 
     public func deviceRowForTest(id: String) async throws -> (mac: String?, name: String?)? {

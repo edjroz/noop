@@ -51,7 +51,7 @@ A few principles run through the whole codebase. Internalize them before opening
    [The BLE safety contract](#the-ble-safety-contract-read-this-before-touching-bluetooth).
 4. **Transparent math.** Analytics are approximations of published methods, documented file by file.
    No black boxes, no claims of clinical accuracy, no reproduction of any proprietary model.
-5. **Credit upstream.** The protocol work is built on prior open-source reverse-engineering —
+5. **Credit upstream.** The protocol work is built on prior community reverse-engineering —
    `johnmiddleton12/my-whoop` (WHOOP 4.0) and `b-nnett/goose` (WHOOP 5.0). Preserve those credits in
    code comments and in [`../ATTRIBUTION.md`](../ATTRIBUTION.md).
 
@@ -60,8 +60,9 @@ A few principles run through the whole codebase. Internalize them before opening
 ## Repository layout
 
 The codebase is split into reusable, cross-platform Swift packages plus a thin platform-specific app
-layer. The **macOS app is the reference implementation**; iOS and Android targets are planned and
-reuse the same packages where they can.
+layer. The **macOS app is the reference implementation**; **Android ships as a full app** under
+`android/`, and **iOS is an experimental, build-from-source community port** (see
+[PR #42](../../../pull/42)). All reuse the same packages where they can.
 
 ```
 Strand/
@@ -79,14 +80,17 @@ Strand/
 ├── StrandTests/                # macOS app unit tests
 ├── Packages/
 │   ├── WhoopProtocol/          # BLE frame parsing, CRC, command/event/packet decode
+│   │                           #   (also builds the `whoop-decode` CLI — runs on Linux)
 │   ├── WhoopStore/             # GRDB/SQLite persistence (migrations, streams, caches)
 │   ├── StrandAnalytics/        # HRV / recovery / strain / sleep / correlation math
 │   ├── StrandImport/           # WHOOP CSV + Apple Health importers
 │   └── StrandDesign/           # SwiftUI design system (palette, components, charts)
 ├── Tools/
 │   └── Backfill/               # `swift run backfill` — re-runs importers into the on-device DB
+├── tools/
+│   └── linux-capture/          # Headless Linux capture workbench (Python/bleak + whoop-decode)
 ├── Fixtures/                   # Sample WHOOP export used by tests
-└── android/                    # Planned Android client (Kotlin/Gradle, separate module)
+└── android/                    # Android client — full shipped app (Kotlin/Gradle, separate module)
 ```
 
 ### Where logic belongs
@@ -100,6 +104,7 @@ Strand/
 | Colors, fonts, motion, cards, charts | `Packages/StrandDesign` | No external UI deps; bridges AppKit/UIKit. |
 | CoreBluetooth, bonding, offload, live state | `Strand/BLE`, `Strand/Collect` | macOS-app layer — wraps the pure packages. |
 | A screen, sidebar item, menu-bar UI, automation | `Strand/Screens`, `Strand/App`, `Strand/System` | App layer. |
+| Capturing strap frames on Linux for protocol RE | `tools/linux-capture` | Python/bleak capture → `whoop-decode`; no Mac/CoreBluetooth. See its [README](../tools/linux-capture/README.md). |
 
 **Rule of thumb:** the more "wire-level" or "math-level" a change is, the deeper into `Packages/` it
 should live, and the more it should be covered by a `swift test` suite that runs without an app, a
@@ -155,6 +160,23 @@ cd Packages/StrandAnalytics && swift build && swift test
 cd Packages/StrandImport   && swift build && swift test
 cd Packages/StrandDesign   && swift build && swift test
 ```
+
+### Linux (protocol RE)
+
+The pure packages build and test on Linux with the standard Swift toolchain (no Apple frameworks).
+`WhoopProtocol` also produces a `whoop-decode` CLI used by the Linux capture workbench:
+
+```bash
+cd Packages/WhoopProtocol
+swift build && swift test                 # decoder + its tests, on Linux
+swift build --product whoop-decode        # the decode CLI → .build/debug/whoop-decode
+
+cd ../../tools/linux-capture
+python3 -m unittest -v                     # framing/reassembly tests (stdlib only, no bleak)
+```
+
+Capturing from a real strap on Linux is documented in
+[`../tools/linux-capture/README.md`](../tools/linux-capture/README.md).
 
 ### macOS app
 
@@ -456,31 +478,37 @@ Schema lives in `Packages/WhoopStore/Sources/WhoopStore/Database.swift` as a **v
 - **No proprietary material.** Don't add WHOOP firmware, decompiled app code, logos, or assets, and
   don't introduce DRM circumvention. Keep contributions to clean-room interoperability with hardware
   the user owns.
+- **Licensing.** By opening a pull request you agree your contribution is licensed under the same
+  [PolyForm Noncommercial License 1.0.0](../LICENSE) as the rest of NOOP. Forks and personal,
+  non-commercial use are welcome under those terms.
 
 ---
 
 ## Roadmap
 
-NOOP's logic already lives in cross-platform packages, so most roadmap items are app-layer wiring
-rather than rewrites of the core. Today the **macOS app is the working reference implementation**;
-everything below is planned or deferred. Contributions toward these are welcome — open an issue to
-coordinate first.
+NOOP's logic already lives in cross-platform packages, so most platform work is app-layer wiring
+rather than rewrites of the core. Today the **macOS app is the working reference implementation**
+and **Android ships as a full app**; the items below are planned, experimental, or deferred.
+Contributions toward these are welcome — open an issue to coordinate first.
 
-### Planned platforms
+### Other platforms
 
-- **Windows app.** A native desktop client for Windows. The protocol facts in
+- **Windows app (planned).** A native desktop client for Windows. The protocol facts in
   `WhoopProtocol/Resources/whoop_protocol.json` and the framing/CRC rules are language-agnostic, so
   the wire behavior is portable; the work is a Windows BLE stack + UI re-implementation that matches
   the shared packages' behavior.
-- **Android device validation.** An `android/` module is scaffolded for a native Kotlin/Gradle
-  client that re-implements the same wire protocol against Android's BLE stack. The near-term task is
-  **validating bond + offload against real WHOOP hardware** on Android and confirming parity with the
-  Swift decode path. (An emulator can't reach a physical strap — this needs a device.)
-- **iOS app.** Every package already declares `.iOS(.v16)` and guards UI-framework code with
-  `#if canImport(UIKit)/AppKit`, so the non-UI core compiles for iOS today. Adding the app is mostly
-  app-layer wiring: an iOS application target depending on the same packages, the iOS Bluetooth
-  Info.plist/entitlements + background mode, and AppKit→UIKit swaps for the handful of macOS-only app
-  files. See [`IOS.md`](IOS.md) for the detailed port plan.
+- **Android (shipped).** A full, native Kotlin/Gradle client lives under `android/`, re-implementing
+  the same wire protocol against Android's BLE stack — it pairs, offloads, persists and scores
+  on-device, and imports WHOOP / Apple Health / Health Connect. Pre-built APKs are in
+  [Releases](../../../releases). Continued real-hardware testing across more devices is always welcome
+  (an emulator can't reach a physical strap).
+- **iOS (experimental community port).** An experimental, build-from-source port lives in
+  [PR #42](../../../pull/42) — an app target plus widgets, a Live Activity, and HealthKit that builds
+  for the iOS simulator. It is **build-it-yourself only, not officially maintained or distributed:**
+  iOS has no anonymous distribution path (the App Store and TestFlight both require a real Apple
+  Developer identity), which is at odds with NOOP staying anonymous. Every package already declares
+  `.iOS(.v16)` and guards UI-framework code with `#if canImport(UIKit)/AppKit`, so the non-UI core
+  compiles for iOS today; [`IOS.md`](IOS.md) is the detailed port plan.
 
 ### Deferred ideas
 

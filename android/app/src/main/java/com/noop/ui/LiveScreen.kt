@@ -7,17 +7,21 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -25,19 +29,27 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import android.Manifest
-import android.content.pm.PackageManager
-import android.os.Build
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.ui.platform.LocalContext
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
+import com.noop.analytics.Sport
+import com.noop.analytics.WorkoutSport
 import com.noop.ble.WhoopModel
 
 /**
@@ -51,41 +63,38 @@ fun LiveScreen(viewModel: AppViewModel) {
     val live by viewModel.live.collectAsStateWithLifecycle()
     val bpm by viewModel.bpm.collectAsStateWithLifecycle()
     val selectedModel by viewModel.selectedModel.collectAsStateWithLifecycle()
-    val context = LocalContext.current
+    val activeWorkout by viewModel.activeWorkout.collectAsStateWithLifecycle()
+    val lastWorkout by viewModel.lastWorkout.collectAsStateWithLifecycle()
 
-    // The runtime Bluetooth permission gates scanning. If it isn't granted, the Connect
-    // button REQUESTS it (rather than silently doing nothing), then connects once allowed.
-    val blePerms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-        arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
-    else
-        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
-    val blePermLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions(),
-    ) { viewModel.connect() }   // granted -> scans; denied -> connect() shows the permission note
-    fun requestConnect() {
-        val granted = blePerms.all {
-            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
-        }
-        if (granted) viewModel.connect() else blePermLauncher.launch(blePerms)
-    }
+    // Imperial/Metric display preference (D#103). Live distance/pace are computed from metres + sec/km
+    // and re-labelled here. Display-only.
+    val unitSystem = UnitPrefs.system(LocalContext.current)
 
-    // Start the realtime HR stream when bonded and on-screen; stop on leave.
-    LaunchedEffect(live.bonded) {
-        if (live.bonded) {
-            viewModel.startRealtimeHr()
-            viewModel.getBattery()
-        }
-    }
+    // The runtime Bluetooth permission gates scanning. If it isn't granted, the Connect button
+    // REQUESTS it (rather than silently doing nothing), then connects once allowed. Shared with
+    // Settings → Re-scan via rememberRequestScan so no entry point can forget the gate (issue #1).
+    val requestConnect = rememberRequestScan { viewModel.connect() }
+
+    // Keep the realtime HR stream on while this screen is visible (ref-counted in the ViewModel, so
+    // navigating to Health Monitor — which also wants it — doesn't stop it). Refresh battery on bond.
     DisposableEffect(Unit) {
-        onDispose { viewModel.stopRealtimeHr() }
+        viewModel.requestRealtimeHr()
+        onDispose { viewModel.releaseRealtimeHr() }
+    }
+    LaunchedEffect(live.bonded) {
+        if (live.bonded) viewModel.getBattery()
     }
 
     ScreenScaffold(title = "Live", subtitle = "All your data · none of the cloud") {
 
         // Connection pill row.
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            // encryptedBond → green "Bonded"; the 5/MG live-HR shortcut (bonded but no genuine encrypted
+            // bond) → amber "Live HR (not fully paired)" so users know the encrypted channel isn't up (#69).
             val (label, tone) = when {
-                live.bonded -> "Bonded" to StrandTone.Positive
+                live.encryptedBond && live.backfilling -> "Bonded · syncing" to StrandTone.Accent
+                live.encryptedBond -> "Bonded" to StrandTone.Positive
+                live.bonded -> "Live HR (not fully paired)" to StrandTone.Warning
                 live.connected -> "Connected" to StrandTone.Warning
                 live.scanning -> "Searching…" to StrandTone.Warning
                 else -> "Disconnected" to StrandTone.Critical
@@ -100,6 +109,72 @@ fun LiveScreen(viewModel: AppViewModel) {
                 color = Palette.textSecondary,
                 modifier = Modifier.fillMaxWidth(),
             )
+        }
+
+        // Strap wiped its Bluetooth bond (firmware reset / official WHOOP app re-bond): show the forget+
+        // re-pair steps in-app instead of looping a dead reconnect — parity with the macOS v1.73 banner.
+        live.reconnectGuide?.let { guide ->
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Palette.surfaceRaised, RoundedCornerShape(12.dp))
+                    .border(1.dp, Palette.statusWarning.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                Text(
+                    "Can't connect — your strap's pairing was reset",
+                    style = NoopType.subhead,
+                    color = Palette.textPrimary,
+                )
+                Text(guide, style = NoopType.footnote, color = Palette.textSecondary)
+            }
+        }
+
+        // Honest sync outcome for a cloud-free app. While offloading, say so plainly — the brief
+        // "· syncing" pill suffix is easy to miss (#91/#93). Otherwise: a non-silent error if the
+        // last offload stalled, else a relative "history synced N ago". (PR #85; sync-visibility v1.70)
+        if (live.backfilling) {
+            // INDETERMINATE on purpose: the strap never tells us how many records remain, so a percent
+            // would be a lie. A small spinner + the live acked-chunk count is the honest "it's working"
+            // signal. The chunk count only appears once the first chunk lands (0 reads as "starting"). (#93)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(13.dp),
+                    strokeWidth = 2.dp,
+                    color = Palette.accent,
+                )
+                Text(
+                    if (live.syncChunksThisSession > 0)
+                        "Syncing your strap history… ${live.syncChunksThisSession} chunks pulled"
+                    else "Syncing your strap history…",
+                    style = NoopType.footnote,
+                    color = Palette.textSecondary,
+                )
+            }
+        } else {
+            val syncError = live.lastSyncError
+            if (syncError != null) {
+                Text(
+                    syncError,
+                    style = NoopType.footnote,
+                    color = Palette.statusWarning,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            } else {
+                live.lastSyncAt?.let { at ->
+                    Text(
+                        "History synced ${relativeAgo(at)}",
+                        style = NoopType.footnote,
+                        color = Palette.textTertiary,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
         }
 
         // Big HR card.
@@ -127,9 +202,83 @@ fun LiveScreen(viewModel: AppViewModel) {
             )
         }
 
-        // Strap picker — choose the model before scanning so we look for exactly one
-        // device family. Hidden once bonded; by then we know what's on the wrist.
-        if (!live.bonded) {
+        // GPS workout sport picker — the shared sheet (also used on the Workouts screen, #115).
+        var showSportPicker by remember { mutableStateOf(false) }
+        if (showSportPicker) {
+            StartWorkoutSheet(vm = viewModel, onDismiss = { showSportPicker = false })
+        }
+
+        // Manual workout — start/stop a session yourself; records HR + strain until you end it.
+        val w = activeWorkout
+        if (w != null) {
+            var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+            LaunchedEffect(w.startMs) {
+                while (true) { nowMs = System.currentTimeMillis(); delay(1000) }
+            }
+            val elapsedS = ((nowMs - w.startMs) / 1000).coerceAtLeast(0)
+            NoopCard {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        Text("● ${w.sport.name.uppercase()}", style = NoopType.overline, color = Palette.statusCritical)
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            String.format("%d:%02d", elapsedS / 60, elapsedS % 60),
+                            style = NoopType.title2, color = Palette.textPrimary,
+                        )
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap)) {
+                        StatTile(modifier = Modifier.weight(1f), label = "HR", value = bpm?.toString() ?: "—")
+                        StatTile(modifier = Modifier.weight(1f), label = "Avg", value = if (w.avgHr > 0) "${w.avgHr}" else "—")
+                        StatTile(modifier = Modifier.weight(1f), label = "Peak", value = if (w.peakHr > 0) "${w.peakHr}" else "—")
+                        StatTile(modifier = Modifier.weight(1f), label = "Strain", value = String.format("%.1f", w.liveStrain))
+                    }
+                    if (w.gpsEnabled) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap)) {
+                            StatTile(modifier = Modifier.weight(1f), label = "Distance", value = liveDistance(w.distanceM, unitSystem))
+                            StatTile(modifier = Modifier.weight(1f), label = "Pace", value = w.paceSecPerKm?.let { livePace(it, unitSystem) } ?: "—")
+                        }
+                    }
+                    Button(
+                        onClick = { viewModel.endWorkout() },
+                        modifier = Modifier.fillMaxWidth(),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Palette.statusCritical, contentColor = Palette.surfaceBase,
+                        ),
+                    ) { Text("End workout", style = NoopType.captionNumber) }
+                }
+            }
+        } else {
+            if (live.bonded) {
+                Button(
+                    onClick = { showSportPicker = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Palette.accent, contentColor = Palette.surfaceBase,
+                    ),
+                ) { Text("Start workout", style = NoopType.captionNumber) }
+            }
+            lastWorkout?.let { row ->
+                val mins = ((row.durationS ?: 0.0) / 60).toInt()
+                val parts = listOfNotNull(
+                    "$mins min",
+                    row.distanceM?.let { liveDistance(it, unitSystem) },
+                    row.avgHr?.let { "$it avg bpm" },
+                    row.strain?.let { String.format("strain %.1f", it) },
+                )
+                Text(
+                    "✓ ${row.sport} saved · ${parts.joinToString(" · ")}",
+                    style = NoopType.footnote, color = Palette.textSecondary,
+                )
+                row.routePolyline?.let { RouteCanvas(it, modifier = Modifier.padding(top = 8.dp)) }
+            }
+        }
+
+        // Strap picker — choose the model before scanning so we look for exactly one device family.
+        // Shown whenever we're not actively streaming, so a user with both a WHOOP 4 and a 5/MG can
+        // switch between them (it used to hide once `bonded`, which stuck after the first pairing).
+        if (!(live.connected && live.bonded)) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(Metrics.gap),
@@ -147,36 +296,125 @@ fun LiveScreen(viewModel: AppViewModel) {
 
         // Controls.
         Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap), modifier = Modifier.fillMaxWidth()) {
+            // Compact, single-line labels: with three weight(1f) buttons in a row, the default
+            // body style + icon could wrap "Re-scan"/"Searching…" to two lines on narrow phones,
+            // making one button taller than the others. captionNumber + maxLines=1 keeps the row
+            // even. Connect disables while a scan is in flight so it can't be re-tapped mid-search.
             Button(
                 onClick = { requestConnect() },
                 modifier = Modifier.weight(1f),
+                enabled = !live.scanning,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Palette.accent,
                     contentColor = Palette.surfaceBase,
                 ),
             ) {
-                Icon(Icons.Filled.Bluetooth, contentDescription = null, modifier = Modifier.padding(end = 6.dp))
-                Text(if (live.connected) "Re-scan" else "Connect", style = NoopType.body)
+                Icon(
+                    Icons.Filled.Bluetooth,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(18.dp)
+                        .padding(end = 4.dp),
+                )
+                Text(
+                    when {
+                        live.scanning -> "Searching…"
+                        live.connected -> "Re-scan"
+                        else -> "Connect"
+                    },
+                    style = NoopType.captionNumber,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Clip,
+                )
             }
 
             OutlinedButton(
                 onClick = { viewModel.buzz(2) },
                 modifier = Modifier.weight(1f),
                 enabled = live.bonded,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Palette.accent),
             ) {
-                Icon(Icons.Filled.GraphicEq, contentDescription = null, modifier = Modifier.padding(end = 6.dp))
-                Text("Buzz", style = NoopType.body)
+                Icon(
+                    Icons.Filled.GraphicEq,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(18.dp)
+                        .padding(end = 4.dp),
+                )
+                Text(
+                    "Buzz",
+                    style = NoopType.captionNumber,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Clip,
+                )
             }
 
             OutlinedButton(
                 onClick = { viewModel.disconnect() },
                 modifier = Modifier.weight(1f),
                 enabled = live.connected,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Palette.statusCritical),
             ) {
-                Icon(Icons.Filled.Close, contentDescription = null, modifier = Modifier.padding(end = 6.dp))
-                Text("End", style = NoopType.body)
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(18.dp)
+                        .padding(end = 4.dp),
+                )
+                Text(
+                    "End",
+                    style = NoopType.captionNumber,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Clip,
+                )
+            }
+        }
+
+        // Manual "Sync now" — kick a historical offload on demand instead of waiting for the 15-min
+        // periodic timer (#93). Only meaningful once bonded (the offload needs the command channel), and
+        // disabled mid-session so a double-tap can't fight the in-flight offload — viewModel.syncNow()
+        // also no-ops in that case, this is just the matching UI state. While syncing, the button shows
+        // an INDETERMINATE spinner (NEVER a percent — total pending records are unknowable from the
+        // protocol); the "Syncing your strap history… N chunks pulled" line above carries the live count.
+        if (live.bonded) {
+            OutlinedButton(
+                onClick = { viewModel.syncNow() },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !live.backfilling,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Palette.accent),
+            ) {
+                if (live.backfilling) {
+                    CircularProgressIndicator(
+                        modifier = Modifier
+                            .size(18.dp)
+                            .padding(end = 4.dp),
+                        strokeWidth = 2.dp,
+                        color = Palette.accent,
+                    )
+                } else {
+                    Icon(
+                        Icons.Filled.Sync,
+                        contentDescription = null,
+                        modifier = Modifier
+                            .size(18.dp)
+                            .padding(end = 4.dp),
+                    )
+                }
+                Text(
+                    if (live.backfilling) "Syncing…" else "Sync now",
+                    style = NoopType.captionNumber,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Clip,
+                )
             }
         }
 
@@ -230,4 +468,33 @@ private fun batteryColor(pct: Double?): Color = when {
     pct < 15 -> Palette.statusCritical
     pct < 30 -> Palette.statusWarning
     else -> Palette.accent
+}
+
+/**
+ * Coarse relative-time label for the "History synced N ago" sync-status line. Pure + unit-tested
+ * (RelativeAgoTest); [nowSec] is injectable for determinism. Buckets to just-now / min / h / d. (PR #85)
+ */
+internal fun relativeAgo(epochSec: Long, nowSec: Long = System.currentTimeMillis() / 1000L): String {
+    val d = (nowSec - epochSec).coerceAtLeast(0)
+    return when {
+        d < 60L -> "just now"
+        d < 3600L -> "${d / 60L} min ago"
+        d < 86_400L -> "${d / 3600L} h ago"
+        else -> "${d / 86_400L} d ago"
+    }
+}
+
+/** Live workout distance from metres, 2-decimal precision, re-labelled to the active system (km / mi). */
+private fun liveDistance(distanceM: Double, system: UnitSystem): String = when (system) {
+    UnitSystem.METRIC -> java.lang.String.format(java.util.Locale.US, "%.2f km", distanceM / 1000.0)
+    UnitSystem.IMPERIAL ->
+        java.lang.String.format(java.util.Locale.US, "%.2f mi", UnitFormatter.kmToMiles(distanceM / 1000.0))
+}
+
+/** Live pace from seconds-per-km, re-labelled to minutes per km / per mile. A per-mile pace is per-km
+ *  divided by miles-per-km (a mile is longer, so the time per unit is larger). */
+private fun livePace(secPerKm: Double, system: UnitSystem): String {
+    val sec = if (system == UnitSystem.IMPERIAL) secPerKm / UnitFormatter.MILES_PER_KILOMETER else secPerKm
+    val unit = if (system == UnitSystem.IMPERIAL) "/mi" else "/km"
+    return java.lang.String.format(java.util.Locale.US, "%d:%02d %s", (sec / 60).toInt(), (sec % 60).toInt(), unit)
 }

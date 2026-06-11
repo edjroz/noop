@@ -214,20 +214,50 @@ extension WhoopStore {
             try db.create(index: "idx_metricSeries_device_key_day",
                           on: "metricSeries", columns: ["deviceId", "key", "day"])
         }
+
+        // v10 (#78): WHOOP5 step_motion_counter persistence (macOS parity with Android's MIGRATION_2_3).
+        // Additive only — the strap trims acked history and won't re-send it, so a destructive rebuild
+        // would lose it; this preserves every existing row. No `synced` column (unused; see StreamStore).
         migrator.registerMigration("v10") { db in
-            // Outbox for the DefraDB sync mirror. When the sidecar is unreachable, upserts get
-            // queued here and drained on reconnect. Natural key (collection, naturalKey) coalesces
-            // repeated offline updates of the same row down to one pending mutation.
-            try db.create(table: "defra_outbox") { t in
-                t.autoIncrementedPrimaryKey("id")
-                t.column("collection", .text).notNull()
-                t.column("naturalKey", .text).notNull()
-                t.column("payloadJSON", .text).notNull()
-                t.column("enqueuedAt", .integer).notNull()
-                t.column("attempts", .integer).notNull().defaults(to: 0)
+            try db.create(table: "stepSample") { t in
+                t.column("deviceId", .text).notNull()
+                t.column("ts", .integer).notNull()
+                t.column("counter", .integer).notNull()
+                t.primaryKey(["deviceId", "ts"])
             }
-            try db.create(index: "idx_defra_outbox_coll_key",
-                          on: "defra_outbox", columns: ["collection", "naturalKey"], unique: true)
+        }
+
+        // v11: on-device daily step total + whole-day calorie estimate on dailyMetric (macOS parity
+        // with Android's MIGRATION_2_3). Additive only; both nullable, so existing rows are untouched
+        // and an old reader that doesn't SELECT them keeps working.
+        migrator.registerMigration("v11") { db in
+            try db.alter(table: "dailyMetric") { t in
+                t.add(column: "steps", .integer)
+                t.add(column: "activeKcalEst", .double)
+            }
+        }
+
+        // v12 (DefraSync fork): outbox for the DefraDB sync mirror. When the sidecar is unreachable,
+        // upserts get queued here and drained on reconnect. Natural key (collection, naturalKey)
+        // coalesces repeated offline updates of the same row down to one pending mutation. This was
+        // numbered v10 in our experiment branch before the upstream merge — renumbered to land cleanly
+        // after upstream's v10 (stepSample) and v11 (dailyMetric.steps/activeKcalEst). Uses `IF NOT
+        // EXISTS` so any local Mac that already ran our old v10 doesn't error on re-bootstrap.
+        migrator.registerMigration("v12") { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS defra_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    collection TEXT NOT NULL,
+                    naturalKey TEXT NOT NULL,
+                    payloadJSON TEXT NOT NULL,
+                    enqueuedAt INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0
+                )
+                """)
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_defra_outbox_coll_key
+                ON defra_outbox(collection, naturalKey)
+                """)
         }
         return migrator
     }

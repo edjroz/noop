@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 
 /**
  * Local Room database — the Android port of the GRDB store in
@@ -12,9 +14,12 @@ import androidx.room.RoomDatabase
  *
  * The schema bundles every Swift migration (v1..v9) into a single fresh shape, since the
  * Android app starts from an empty store (no in-place migration from a prior Android version).
- * version 2 adds the v8 journal/workout/appleDaily caches; fallbackToDestructiveMigration()
- * (below) rebuilds the file rather than crashing, which is safe on this fresh, user-less app.
- * exportSchema = false: no schema JSON is emitted.
+ * version 2 added the v8 journal/workout/appleDaily caches. **v3 (#78)** adds the stepSample table
+ * + dailyMetric.steps/activeKcalEst via a REAL additive migration (MIGRATION_2_3) — NOT a destructive
+ * rebuild — so a user's already-offloaded raw streams survive (the strap trims acked history and won't
+ * re-send it). The destructive fallback is deliberately GONE: with exportSchema=false there's no
+ * build-time schema check, so a hand-written-SQL mismatch would otherwise SILENTLY wipe that history;
+ * without the fallback Room throws loudly instead, and MigrationRoundTripTest guards the SQL in CI.
  */
 @Database(
     entities = [
@@ -25,6 +30,7 @@ import androidx.room.RoomDatabase
         BatterySample::class,
         Spo2Sample::class,
         SkinTempSample::class,
+        StepSample::class,
         RespSample::class,
         GravitySample::class,
         DailyMetric::class,
@@ -32,9 +38,10 @@ import androidx.room.RoomDatabase
         MetricSeriesRow::class,
         JournalEntry::class,
         WorkoutRow::class,
+        DismissedWorkout::class,
         AppleDaily::class,
     ],
-    version = 2,
+    version = 5,
     exportSchema = false,
 )
 abstract class WhoopDatabase : RoomDatabase() {
@@ -64,11 +71,60 @@ abstract class WhoopDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v2 → v3: ADDITIVE ONLY — adds the stepSample table + dailyMetric.steps/activeKcalEst.
+         * A real (non-destructive) migration so an existing user's already-offloaded raw streams are
+         * PRESERVED (the strap trims acked history chunks and will not re-send them, so a destructive
+         * rebuild would lose that history permanently). The SQL MUST match Room's generated schema
+         * exactly — NOT NULL for `synced` (Kotlin default, no SQL DEFAULT), nullable INTEGER/REAL for
+         * the two new dailyMetric columns. Guarded by MigrationRoundTripTest.
+         */
+        internal val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `stepSample` (`deviceId` TEXT NOT NULL, " +
+                        "`ts` INTEGER NOT NULL, `counter` INTEGER NOT NULL, " +
+                        "`synced` INTEGER NOT NULL, PRIMARY KEY(`deviceId`, `ts`))",
+                )
+                db.execSQL("ALTER TABLE `dailyMetric` ADD COLUMN `steps` INTEGER")
+                db.execSQL("ALTER TABLE `dailyMetric` ADD COLUMN `activeKcalEst` REAL")
+            }
+        }
+
+        /**
+         * v3 -> v4: ADDITIVE — adds `workout.routePolyline` (nullable TEXT) for GPS routes. Nullable so
+         * existing workouts migrate untouched; the SQL must match Room's generated schema for a `String?`
+         * column exactly (TEXT, no NOT NULL, no default). Mirrors MIGRATION_2_3's additive form.
+         */
+        internal val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `workout` ADD COLUMN `routePolyline` TEXT")
+            }
+        }
+
+        /**
+         * v4 -> v5: ADDITIVE — adds the `dismissedWorkout` table (#107): a durable marker that keeps a
+         * dismissed auto-detected bout hidden after the engine re-derives it. CREATE TABLE only (no
+         * data touched), so existing workouts/history are untouched. The SQL MUST match Room's
+         * generated schema for the [DismissedWorkout] entity exactly — all three PK columns NOT NULL,
+         * composite PRIMARY KEY in declaration order. Guarded by MigrationRoundTripTest like the others.
+         */
+        internal val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `dismissedWorkout` (`deviceId` TEXT NOT NULL, " +
+                        "`startTs` INTEGER NOT NULL, `endTs` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`deviceId`, `startTs`))",
+                )
+            }
+        }
+
         private fun build(appContext: Context): WhoopDatabase =
             Room.databaseBuilder(appContext, WhoopDatabase::class.java, DB_NAME)
-                // Schema only ever moves forward from a fresh install; if a future entity
-                // change bumps the version, rebuild rather than crash on a missing migration.
-                .fallbackToDestructiveMigration()
+                // Real additive migration — NO destructive fallback (see the class doc): with
+                // exportSchema=false a silent rebuild would lose already-acked, non-resendable strap
+                // history on any schema mismatch. Room throws loudly instead; CI guards the SQL.
+                .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                 .build()
     }
 }

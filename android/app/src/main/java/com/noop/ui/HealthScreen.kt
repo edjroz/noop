@@ -10,14 +10,21 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.noop.analytics.Baselines
+import com.noop.analytics.VitalBands
 import com.noop.ble.LiveState
 import com.noop.data.DailyMetric
 import kotlin.math.roundToInt
@@ -31,17 +38,27 @@ import kotlin.math.roundToInt
 // locked NOOP component system: every surface is a NoopCard/StatTile, every chart
 // is a Canvas chart — no ad-hoc card heights or paddings.
 //
-// macOS parity note: macOS read HR-max from a ProfileStore. There is no profile
-// store on Android yet, so we use a fixed age-agnostic default (220 - 30 = 190 bpm).
-// SpO2 / respiratory / skin-temp are sleep-window aggregates, so the "Vital Signs"
-// grid is sourced from the most recent imported DailyMetric, exactly as on macOS.
-
-private const val HR_MAX_DEFAULT = 190
+// macOS parity note: live HR zone/%max reads the user's ProfileStore max heart rate,
+// matching Settings/onboarding. SpO2 / respiratory / skin-temp are sleep-window
+// aggregates, so the "Vital Signs" grid is sourced from today's DailyMetric.
 
 @Composable
 fun HealthScreen(vm: AppViewModel) {
+    val context = LocalContext.current
+    val profile = remember { ProfileStore.from(context.applicationContext) }
     val live by vm.live.collectAsStateWithLifecycle()
     val today by vm.today.collectAsStateWithLifecycle()
+    // Full merged daily history — feeds the personal-baseline banding of the vitals grid.
+    val days by vm.recentDays.collectAsStateWithLifecycle()
+    val hrMax = profile.hrMax
+
+    // Health Monitor shows live HR too, so it must keep the realtime stream on while it's visible —
+    // otherwise leaving the Live page stopped the stream and this page froze (issue #18). Ref-counted
+    // in the ViewModel, so handing off between Live and here never drops the stream.
+    DisposableEffect(Unit) {
+        vm.requestRealtimeHr()
+        onDispose { vm.releaseRealtimeHr() }
+    }
 
     val displayHr = displayHr(live)
     val hasLiveHr = displayHr != null
@@ -55,9 +72,9 @@ fun HealthScreen(vm: AppViewModel) {
         } else {
             // ScreenScaffold applies a 20dp arrangement gap between its direct children;
             // a small top-up reaches the section gap (28dp) used between macOS sections.
-            HeartRateSection(live = live)
+            HeartRateSection(live = live, hrMax = hrMax)
             Spacer(Modifier.height(Metrics.sectionGap - 20.dp))
-            VitalsSection(today = today)
+            VitalsSection(today = today, days = days)
         }
     }
 }
@@ -78,9 +95,9 @@ private fun hrIsDerived(live: LiveState): Boolean =
     (live.heartRate ?: 0) <= 0 && live.rr.isNotEmpty()
 
 /** HR as a fraction of HR-max (0..1). */
-private fun hrFraction(hr: Int?): Double {
-    if (hr == null || HR_MAX_DEFAULT <= 0) return 0.0
-    return (hr.toDouble() / HR_MAX_DEFAULT).coerceIn(0.0, 1.0)
+private fun hrFraction(hr: Int?, hrMax: Int): Double {
+    if (hr == null || hrMax <= 0) return 0.0
+    return (hr.toDouble() / hrMax).coerceIn(0.0, 1.0)
 }
 
 /** Current zone 1..5 from %HR-max (WHOOP/Karvonen-style bands: 50/60/70/80/90). */
@@ -92,9 +109,12 @@ private fun hrZone(fraction: Double): Int = when {
     else -> 5
 }
 
-/** A short HR series for the hero chart, derived from streamed R-R intervals (newest
- *  last). Falls back to a flat pair at the current HR when R-R is sparse. */
-private fun hrSeries(live: LiveState, hr: Int?): List<Double> {
+/** A short HR series for the hero chart. Prefers the accumulated live-HR history (which moves over
+ *  time); falls back to per-beat HR from R-R, then to a flat pair while the buffer fills. The old
+ *  version derived ONLY from R-R, which is sparse on WHOOP 4, so it sat on a flat 2-point line even
+ *  while HR was clearly changing (issue #18). */
+private fun hrSeries(history: List<Int>, live: LiveState, hr: Int?): List<Double> {
+    if (history.size > 1) return history.map { it.toDouble() }
     val beats = live.rr.takeLast(60).mapNotNull { rr ->
         if (rr > 0) 60_000.0 / rr else null
     }
@@ -106,13 +126,22 @@ private fun hrSeries(live: LiveState, hr: Int?): List<Double> {
 // MARK: - Heart rate hero (live)
 
 @Composable
-private fun HeartRateSection(live: LiveState) {
+private fun HeartRateSection(live: LiveState, hrMax: Int) {
     val displayHr = displayHr(live)
     val hasLiveHr = displayHr != null
     val derived = hrIsDerived(live)
-    val fraction = hrFraction(displayHr)
+    val fraction = hrFraction(displayHr, hrMax)
     val zone = hrZone(fraction)
-    val series = hrSeries(live, displayHr)
+    // Accumulate the streamed HR over time so the hero chart actually moves (issue #18 — it used to
+    // derive from sparse R-R and flat-line). Lives in UI state; resets when you leave the screen.
+    val hrHistory = remember { mutableStateListOf<Int>() }
+    LaunchedEffect(displayHr) {
+        displayHr?.let { if (it in 30..220) {
+            hrHistory.add(it)
+            if (hrHistory.size > 90) hrHistory.removeAt(0)
+        } }
+    }
+    val series = hrSeries(hrHistory, live, displayHr)
     val zoneColor = Palette.hrZoneColor(zone)
 
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
@@ -190,7 +219,7 @@ private fun HeartRateSection(live: LiveState) {
                 HeartRateFooter(
                     zone = if (hasLiveHr) "Z$zone" else "—",
                     percentMax = if (hasLiveHr) "${(fraction * 100).roundToInt()}%" else "—",
-                    maxHr = "$HR_MAX_DEFAULT",
+                    maxHr = "$hrMax",
                     state = if (hasLiveHr) "STREAMING" else "IDLE",
                 )
             }
@@ -224,8 +253,11 @@ private fun FooterStat(label: String, value: String, modifier: Modifier = Modifi
 // MARK: - Vitals grid (uniform StatTiles)
 
 @Composable
-private fun VitalsSection(today: DailyMetric?) {
-    val vitals = vitalsFor(today)
+private fun VitalsSection(today: DailyMetric?, days: List<DailyMetric>) {
+    // Temperature display preference (D#103). Skin temp is stored in °C; the toggle re-labels it to °F.
+    // Display-only — banding still runs on the stored °C value.
+    val tempUnit = UnitPrefs.temperature(LocalContext.current)
+    val vitals = vitalsFor(today, days, tempUnit)
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
         SectionHeader(
             title = "Vital Signs",
@@ -258,7 +290,9 @@ private fun VitalsSection(today: DailyMetric?) {
 
         Text(
             text = "SpO₂, respiratory rate and skin temperature are sleep-window " +
-                "aggregates from your most recent imported day; resting HR and HRV update daily.",
+                "aggregates from your most recent imported day; resting HR and HRV update daily. " +
+                "Once NOOP has 14 nights of history, in-range compares each vital to your own " +
+                "baseline (approximate — not medical advice); until then typical adult ranges apply.",
             style = NoopType.footnote,
             color = Palette.textTertiary,
         )
@@ -273,64 +307,118 @@ private data class Vital(
     val unit: String,
     val value: Double?,
     val format: (Double) -> String,
-    /** Healthy range used to compute the in-range state (inclusive). */
-    val inRange: ClosedFloatingPointRange<Double>,
+    /** Personal-baseline banding (population fallback until 14 trusted nights). */
+    val banding: VitalBands.Result,
     /** The metric's category colour (used only when in range). */
     val metricColor: Color,
 ) {
-    val isInRange: Boolean = value?.let { inRange.contains(it) } ?: false
-
     /** Value with its unit appended, or null when no data. */
     val formattedValue: String? = value?.let { "${format(it)} $unit" }
 
     /** Colour communicates state: in-range = the metric's category colour,
      *  out-of-range = warning amber, no data = tertiary. */
-    val accent: Color = when {
-        value == null -> Palette.textTertiary
-        isInRange -> metricColor
-        else -> Palette.statusWarning
+    val accent: Color = when (banding.band) {
+        VitalBands.Band.NO_DATA -> Palette.textTertiary
+        VitalBands.Band.IN_RANGE -> metricColor
+        VitalBands.Band.OUT_OF_RANGE -> Palette.statusWarning
     }
 
-    /** The textual in-range caption that stands in for a StatePill inside the
-     *  fixed-height tile (keeps the row pixel-uniform). */
+    /** The in-range caption that stands in for a StatePill inside the fixed-height tile.
+     *  The wording says which yardstick judged it: your baseline vs typical ranges. */
     val stateCaption: String = when {
-        value == null -> "No data"
-        isInRange -> "In range"
-        else -> "Out of range"
+        banding.band == VitalBands.Band.NO_DATA -> "No data"
+        banding.basis == VitalBands.Basis.PERSONAL ->
+            if (banding.band == VitalBands.Band.IN_RANGE) "In your range" else "Off your baseline"
+        else ->
+            if (banding.band == VitalBands.Band.IN_RANGE) "In typical range" else "Outside typical range"
     }
 
     val accessibilityText: String =
-        formattedValue?.let { "$label: $it, ${if (isInRange) "in range" else "out of range"}" }
-            ?: "$label: no data"
+        formattedValue?.let { "$label: $it, $stateCaption" } ?: "$label: no data"
 }
 
-private fun vitalsFor(d: DailyMetric?): List<Vital> = listOf(
-    Vital(
-        key = "resp", label = "Resp Rate", unit = "rpm",
-        value = d?.respRateBpm, format = { String.format("%.1f", it) },
-        inRange = 12.0..20.0, metricColor = Palette.metricCyan,
-    ),
-    Vital(
-        key = "spo2", label = "Blood O₂", unit = "%",
-        value = d?.spo2Pct, format = { String.format("%.0f", it) },
-        inRange = 95.0..100.0, metricColor = Palette.metricCyan,
-    ),
-    Vital(
-        key = "rhr", label = "Resting HR", unit = "bpm",
-        value = d?.restingHr?.toDouble(), format = { it.roundToInt().toString() },
-        inRange = 40.0..60.0, metricColor = Palette.metricRose,
-    ),
-    Vital(
-        key = "hrv", label = "HRV", unit = "ms",
-        value = d?.avgHrv, format = { it.roundToInt().toString() },
-        inRange = 40.0..120.0, metricColor = Palette.metricPurple,
-    ),
-    Vital(
-        key = "skin", label = "Skin Temp", unit = "°C",
-        value = d?.skinTempDevC, format = { String.format("%.1f", it) },
-        inRange = 33.0..36.0, metricColor = Palette.metricAmber,
-    ),
-)
+/** Build the vitals, banded against the user's OWN trailing baseline once 14 trusted
+ *  nights exist (population ranges before that — VitalBands does the deciding). */
+private fun vitalsFor(
+    d: DailyMetric?,
+    days: List<DailyMetric>,
+    tempUnit: TemperatureUnit = TemperatureUnit.CELSIUS,
+): List<Vital> {
+    val todayKey = d?.day
+    // History strictly before the displayed day, oldest→newest (recentDays is already
+    // oldest→newest); calendar-padded so wear gaps count as missing nights (a stale
+    // baseline then falls back to the population range).
+    val history = days.filter { row -> todayKey == null || row.day < todayKey }
+    fun series(selector: (DailyMetric) -> Double?): List<Double?> =
+        VitalBands.calendarSeries(history.map { it.day to selector(it) })
+
+    // Skin temp is bimodal: CSV imports store ABSOLUTE °C, the on-device pipeline a ±°C
+    // DEVIATION — partition the history to the displayed value's kind and pick the matching
+    // config + population fallback (±0.6 °C mirrors the illness watch's flag threshold).
+    // This also fixes the live bug where a strap-computed +0.2 °C deviation read
+    // "Out of range" against the 33–36 absolute band.
+    val skin = d?.skinTempDevC
+    // Track which kind the value is so the temperature converter picks the right rule: an ABSOLUTE
+    // reading uses the full C→F formula (×9/5 + 32); a ±DEVIATION must omit the offset.
+    val skinIsAbsolute = skin?.let { VitalBands.isAbsoluteSkinTemp(it) } ?: true
+    val skinResult: VitalBands.Result = if (skin == null) {
+        VitalBands.Result(VitalBands.Band.NO_DATA, VitalBands.Basis.POPULATION, 0)
+    } else {
+        VitalBands.band(
+            value = skin,
+            history = VitalBands.skinTempHistory(skin, series { it.skinTempDevC }),
+            populationRange = if (skinIsAbsolute) 33.0..36.0 else -0.6..0.6,
+            cfg = if (skinIsAbsolute) Baselines.metricCfg.getValue("skin_temp") else VitalBands.skinTempDeviationCfg,
+        )
+    }
+    // Resolve the skin-temp label + converter once, honouring the °C/°F preference. `Vital.formattedValue`
+    // appends `unit`, so strip the trailing " °C/°F" the formatter adds.
+    val skinUnitLabel = UnitFormatter.temperatureUnit(tempUnit)
+    val skinFormat: (Double) -> String = { c ->
+        val full = if (skinIsAbsolute) {
+            UnitFormatter.temperatureFromCelsius(c, tempUnit, decimals = 1)
+        } else {
+            UnitFormatter.temperatureDeltaFromCelsius(c, tempUnit, decimals = 1)
+        }
+        full.removeSuffix(" $skinUnitLabel")
+    }
+    return listOf(
+        Vital(
+            key = "resp", label = "Resp Rate", unit = "rpm",
+            value = d?.respRateBpm, format = { String.format("%.1f", it) },
+            banding = VitalBands.band(d?.respRateBpm, series { it.respRateBpm }, 12.0..20.0, Baselines.respCfg),
+            metricColor = Palette.metricCyan,
+        ),
+        Vital(
+            key = "spo2", label = "Blood O₂", unit = "%",
+            value = d?.spo2Pct, format = { String.format("%.0f", it) },
+            // Population-only on purpose: an absolute <95% floor is meaningful regardless
+            // of personal baseline (no "spo2" MetricCfg exists).
+            banding = VitalBands.band(d?.spo2Pct, emptyList(), 95.0..100.0, null),
+            metricColor = Palette.metricCyan,
+        ),
+        Vital(
+            key = "rhr", label = "Resting HR", unit = "bpm",
+            value = d?.restingHr?.toDouble(), format = { it.roundToInt().toString() },
+            banding = VitalBands.band(
+                d?.restingHr?.toDouble(), series { it.restingHr?.toDouble() }, 40.0..60.0,
+                Baselines.restingHRCfg,
+            ),
+            metricColor = Palette.metricRose,
+        ),
+        Vital(
+            key = "hrv", label = "HRV", unit = "ms",
+            value = d?.avgHrv, format = { it.roundToInt().toString() },
+            banding = VitalBands.band(d?.avgHrv, series { it.avgHrv }, 40.0..120.0, Baselines.hrvCfg),
+            metricColor = Palette.metricPurple,
+        ),
+        Vital(
+            key = "skin", label = "Skin Temp", unit = skinUnitLabel,
+            value = skin, format = skinFormat,
+            banding = skinResult, metricColor = Palette.metricAmber,
+        ),
+    )
+}
 
 // MARK: - Empty state
 

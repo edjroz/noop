@@ -3,6 +3,7 @@ package com.noop.data
 import android.content.Context
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
+import kotlin.math.roundToInt
 
 /**
  * Decoded streams to persist in one transaction. Android mirror of the Swift `Streams`
@@ -21,10 +22,12 @@ data class StreamBatch(
     val skinTemp: List<SkinTempRow> = emptyList(),
     val resp: List<RespRow> = emptyList(),
     val gravity: List<GravityRow> = emptyList(),
+    val steps: List<StepRow> = emptyList(),
 ) {
     val isEmpty: Boolean
         get() = hr.isEmpty() && rr.isEmpty() && events.isEmpty() && battery.isEmpty() &&
-            spo2.isEmpty() && skinTemp.isEmpty() && resp.isEmpty() && gravity.isEmpty()
+            spo2.isEmpty() && skinTemp.isEmpty() && resp.isEmpty() && gravity.isEmpty() &&
+            steps.isEmpty()
 }
 
 // Device-agnostic decoded rows (deviceId attached when inserted). Mirror Streams.swift shapes.
@@ -36,6 +39,8 @@ data class EventEntry(val ts: Long, val kind: String, val payloadJSON: String)
 data class BatteryRow(val ts: Long, val soc: Double?, val mv: Int?, val charging: Boolean? = null)
 data class Spo2Row(val ts: Long, val red: Int, val ir: Int)
 data class SkinTempRow(val ts: Long, val raw: Int)
+/** Cumulative u16 step/motion counter at [ts] (WHOOP5 step_motion_counter@57). deviceId attached on insert. (#78) */
+data class StepRow(val ts: Long, val counter: Int)
 data class RespRow(val ts: Long, val raw: Int)
 data class GravityRow(val ts: Long, val x: Double, val y: Double, val z: Double)
 
@@ -47,6 +52,7 @@ data class InsertCounts(
     val battery: Int = 0,
     val spo2: Int = 0,
     val skinTemp: Int = 0,
+    val steps: Int = 0,
     val resp: Int = 0,
     val gravity: Int = 0,
 )
@@ -100,6 +106,8 @@ class WhoopRepository(private val dao: WhoopDao) {
             dao.insertSpo2(streams.spo2.map { Spo2Sample(deviceId, it.ts, it.red, it.ir) })
         val skinIds = if (streams.skinTemp.isEmpty()) emptyList() else
             dao.insertSkinTemp(streams.skinTemp.map { SkinTempSample(deviceId, it.ts, it.raw) })
+        val stepIds = if (streams.steps.isEmpty()) emptyList() else
+            dao.insertSteps(streams.steps.map { StepSample(deviceId, it.ts, it.counter) })
         val respIds = if (streams.resp.isEmpty()) emptyList() else
             dao.insertResp(streams.resp.map { RespSample(deviceId, it.ts, it.raw) })
         val gravIds = if (streams.gravity.isEmpty()) emptyList() else
@@ -113,6 +121,7 @@ class WhoopRepository(private val dao: WhoopDao) {
             battery = batIds.countInserted(),
             spo2 = spo2Ids.countInserted(),
             skinTemp = skinIds.countInserted(),
+            steps = stepIds.countInserted(),
             resp = respIds.countInserted(),
             gravity = gravIds.countInserted(),
         )
@@ -132,6 +141,36 @@ class WhoopRepository(private val dao: WhoopDao) {
     suspend fun hrSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.hrSamples(deviceId, from, to, limit)
 
+    /** Downsampled HR (mean bpm per [bucketSeconds]) for the strap, for the Today 24h trend chart. */
+    suspend fun hrBuckets(deviceId: String, from: Long, to: Long, bucketSeconds: Long = 300L) =
+        dao.hrBuckets(deviceId, from, to, bucketSeconds)
+
+    /**
+     * DISPLAY-ONLY: fill missing workout HR from the strap's own samples (#77). An imported session
+     * (Health Connect / Apple Health) stores avgHr = null, but if the strap was worn during that
+     * window its ~1 Hz samples are already in Room under the strap device id — so derive avg/max
+     * from them. Fills only rows whose avgHr is null (never mixes sources within a row), requires
+     * [minSamples] (~1 min of data) so a few stray samples can't fabricate an average, and caps the
+     * lookups so a huge history can't jank first paint. NEVER persisted — a re-import must not see
+     * UI-derived values (the workout PK upsert would wipe them anyway).
+     */
+    suspend fun fillWorkoutHrFromStrap(
+        rows: List<WorkoutRow>,
+        strapDeviceId: String = "my-whoop",
+        minSamples: Long = 60,
+        cap: Int = 300,
+    ): List<WorkoutRow> {
+        var budget = cap
+        return rows.map { row ->
+            if (row.avgHr != null || row.endTs <= row.startTs || budget <= 0) return@map row
+            budget -= 1
+            val stats = dao.hrWindowStats(strapDeviceId, row.startTs, row.endTs)
+            if (stats.n >= minSamples && stats.avg != null && stats.max != null) {
+                row.copy(avgHr = stats.avg.roundToInt(), maxHr = row.maxHr ?: stats.max)
+            } else row
+        }
+    }
+
     suspend fun rrIntervals(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.rrIntervals(deviceId, from, to, limit)
 
@@ -146,6 +185,78 @@ class WhoopRepository(private val dao: WhoopDao) {
 
     suspend fun skinTempSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.skinTempSamples(deviceId, from, to, limit)
+
+    suspend fun stepSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
+        dao.stepSamples(deviceId, from, to, limit)
+
+    /** Delete a computed source's [sport] workouts in [from, to] (makes re-detection idempotent). (#78) */
+    suspend fun deleteComputedWorkouts(deviceId: String, sport: String, from: Long, to: Long) =
+        dao.deleteWorkoutsBySport(deviceId, sport, from, to)
+
+    // MARK: - Workout editing (manual add/edit · relabel · dismiss · delete) (#107)
+    //
+    // Mirrors macOS Repository's workout-editing surface. Manual workouts live under the strap source
+    // ([strapDeviceId], source "manual") — the same place live-tracked sessions land. Detected bouts
+    // live under "<strapDeviceId>-noop" with sport "detected" and are wiped + re-derived each engine
+    // run, so a durable dismissal is recorded in the independent `dismissedWorkout` table.
+
+    /** Dismissed detected-bout markers for the computed source of [strapDeviceId]. */
+    suspend fun dismissedDetected(strapDeviceId: String = "my-whoop"): List<DismissedWorkout> =
+        dao.dismissedWorkouts(computedDeviceId(strapDeviceId))
+
+    /**
+     * Persist a retroactive / edited manual workout under the strap source. [replacing] is the row the
+     * edit started from:
+     *  - editing a DETECTED bout replaces it with this manual row — the detected original is dismissed
+     *    durably so the re-detector doesn't bring it back (else both would show);
+     *  - editing a MANUAL row whose natural key (startTs/sport) changed deletes the stale row first
+     *    (the (deviceId, startTs, sport) PK upsert would otherwise orphan it);
+     *  - an IMPORTED row is never passed here as `replacing` (duplicating one is a pure add).
+     */
+    suspend fun saveManualWorkout(row: WorkoutRow, replacing: WorkoutRow? = null) {
+        if (replacing != null && replacing.source.lowercase().endsWith("-noop")) {
+            dismissDetected(replacing)
+        } else if (replacing != null && (replacing.startTs != row.startTs || replacing.sport != row.sport)) {
+            dao.deleteWorkoutByKey(replacing.deviceId, replacing.startTs, replacing.sport)
+        }
+        dao.upsertWorkouts(listOf(row))
+    }
+
+    /**
+     * Re-label a detected bout: copy it to a manual strap row with the chosen [sport], then delete the
+     * detected original. Survives analyzeRecent — the engine re-derives only sport="detected" rows AND
+     * skips any re-derived bout overlapping a real strap workout, which this copy now is — so the same
+     * session is never re-created as a duplicate. (#107)
+     */
+    suspend fun relabelDetected(row: WorkoutRow, sport: String, strapDeviceId: String = "my-whoop") {
+        val trimmed = sport.trim()
+        if (trimmed.isEmpty()) return
+        val manual = row.copy(deviceId = strapDeviceId, sport = trimmed, source = "manual")
+        dao.upsertWorkouts(listOf(manual))
+        dao.deleteWorkoutsBySport(computedDeviceId(strapDeviceId), "detected", row.startTs, row.startTs)
+    }
+
+    /**
+     * Dismiss a DETECTED bout the user says isn't a workout: record a durable marker (so a re-detect
+     * that recreates the same PK stays hidden) AND delete the current row so it disappears now.
+     * No-op when the row isn't a detected bout. (#107)
+     */
+    suspend fun dismissDetected(row: WorkoutRow) {
+        if (!row.source.lowercase().endsWith("-noop")) return
+        // Marker carries the bout's [startTs, endTs] span so a re-detected bout whose boundary drifts
+        // still overlaps it and stays hidden (matches macOS dismissed-span semantics).
+        dao.insertDismissed(listOf(DismissedWorkout(row.deviceId, row.startTs, row.endTs)))
+        dao.deleteWorkoutsBySport(row.deviceId, row.sport, row.startTs, row.startTs)
+    }
+
+    /**
+     * Delete ONE workout. A detected bout is dismissed durably (so it doesn't come back on the next
+     * re-detect); everything else is removed by its exact natural key. (#107)
+     */
+    suspend fun deleteWorkout(row: WorkoutRow) {
+        if (row.source.lowercase().endsWith("-noop")) { dismissDetected(row); return }
+        dao.deleteWorkoutByKey(row.deviceId, row.startTs, row.sport)
+    }
 
     suspend fun respSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.respSamples(deviceId, from, to, limit)
@@ -170,12 +281,32 @@ class WhoopRepository(private val dao: WhoopDao) {
     suspend fun journal(deviceId: String, from: String, to: String): List<JournalEntry> =
         dao.journal(deviceId, from, to)
 
+    /** Delete one native journal answer by natural key (only ever called with the "noop-journal"
+     *  source id — imported rows are never touched). */
+    suspend fun deleteJournalEntry(deviceId: String, day: String, question: String) =
+        dao.deleteJournalEntry(deviceId, day, question)
+
     /** Apple-Health daily aggregates for the inclusive day range [from, to] (YYYY-MM-DD), oldest first. */
     suspend fun appleDaily(deviceId: String, from: String, to: String): List<AppleDaily> =
         dao.appleDaily(deviceId, from, to)
 
     /** All cached daily metrics for a device, oldest first. Feeds com.noop.analytics.IllnessWatch. */
     suspend fun days(deviceId: String): List<DailyMetric> = dao.days(deviceId)
+
+    /**
+     * One-time #34 refile: move legacy Health Connect data out of the shared "apple-health" bucket into
+     * its own "health-connect" source, so it stops being shown as Apple Health. HC workouts are tagged
+     * `source = "health-connect"` so they move unconditionally; the daily aggregates only move when there
+     * is no Apple Health EXPORT (no apple-health metricSeries), since only the export writes metricSeries.
+     * Idempotent + safe (runs before this import writes any HC data, so no PK conflict).
+     */
+    suspend fun refileLegacyHealthConnect() {
+        dao.reassignWorkoutsBySource(from = "apple-health", to = "health-connect", source = "health-connect")
+        if (dao.metricSeriesCount("apple-health") == 0) {
+            dao.reassignAppleDaily(from = "apple-health", to = "health-connect")
+            upsertDevice("health-connect", name = "Health Connect")
+        }
+    }
 
     // MARK: - Merged reads (imported source wins per day; computed "-noop" gap-fills)
     //
@@ -254,7 +385,37 @@ class WhoopRepository(private val dao: WhoopDao) {
         ): List<DailyMetric> {
             val byDay = LinkedHashMap<String, DailyMetric>()
             for (d in computed) byDay[d.day] = d // computed first…
-            for (d in imported) byDay[d.day] = d // …import overwrites, so a real WHOOP import always wins
+            // …import overwrites, so a real WHOOP import always wins — BUT coalesce the strap-only
+            // on-device metrics (steps / calories / RSA resp) from the computed row, since importers
+            // (esp. Health Connect) write a "my-whoop" daily row with those columns null and would
+            // otherwise blank them on days the import also covers. (#78)
+            for (d in imported) {
+                val c = byDay[d.day]
+                // Per-FIELD coalesce: the imported row wins for every column it actually has, but any
+                // column it leaves null is gap-filled from the computed row. A real WHOOP import has
+                // its scores/stages set, so "d.x ?: c.x" is a no-op there. A Health Connect import,
+                // though, writes a "my-whoop" row with recovery/strain/sleep-stages NULL — without this
+                // it would BLANK a strap-computed day (and a stale one already written stays blanked).
+                // Coalescing every nullable field both prevents that and HEALS days already shadowed. (#112)
+                byDay[d.day] = if (c == null) d else d.copy(
+                    totalSleepMin = d.totalSleepMin ?: c.totalSleepMin,
+                    efficiency = d.efficiency ?: c.efficiency,
+                    deepMin = d.deepMin ?: c.deepMin,
+                    remMin = d.remMin ?: c.remMin,
+                    lightMin = d.lightMin ?: c.lightMin,
+                    disturbances = d.disturbances ?: c.disturbances,
+                    restingHr = d.restingHr ?: c.restingHr,
+                    avgHrv = d.avgHrv ?: c.avgHrv,
+                    recovery = d.recovery ?: c.recovery,
+                    strain = d.strain ?: c.strain,
+                    exerciseCount = d.exerciseCount ?: c.exerciseCount,
+                    spo2Pct = d.spo2Pct ?: c.spo2Pct,
+                    skinTempDevC = d.skinTempDevC ?: c.skinTempDevC,
+                    respRateBpm = d.respRateBpm ?: c.respRateBpm,
+                    steps = d.steps ?: c.steps,
+                    activeKcalEst = d.activeKcalEst ?: c.activeKcalEst,
+                )
+            }
             return byDay.values.sortedBy { it.day }
         }
 

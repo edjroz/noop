@@ -73,3 +73,7 @@ export.zip
 # 173 MB upstream release — never committed; fetched per-machine via Tools/defradb/fetch.sh.
 # The script + checksum file are committed so both Macs land on the same pinned version.
 Tools/defradb/defradb-darwin-*
+
+# ── Python bytecode (tools/linux-capture) ─────────────────────────
+__pycache__/
+*.pyc

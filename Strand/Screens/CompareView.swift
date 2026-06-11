@@ -256,11 +256,20 @@ struct CompareView: View {
             SectionHeader("Metrics", overline: "Overlay 2–4 signals")
             NoopCard {
                 VStack(alignment: .leading, spacing: NoopMetrics.gap) {
-                    HStack(alignment: .center) {
-                        SegmentedPillControl(CompareRange.allCases, selection: $range) { $0.label }
-                            .accessibilityLabel("Time range")
-                        Spacer()
-                        addMenu
+                    // Responsive: range pills + the Add menu side-by-side when there's room, else
+                    // stacked so the pills don't overflow/clip on a narrow window (ported from the iOS port).
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .center) {
+                            SegmentedPillControl(CompareRange.allCases, selection: $range) { $0.label }
+                                .accessibilityLabel("Time range")
+                            Spacer()
+                            addMenu
+                        }
+                        VStack(alignment: .leading, spacing: NoopMetrics.gap) {
+                            SegmentedPillControl(CompareRange.allCases, selection: $range) { $0.label }
+                                .accessibilityLabel("Time range")
+                            addMenu
+                        }
                     }
 
                     if selected.count >= minSelection {
@@ -341,7 +350,7 @@ struct CompareView: View {
     private func overlaySection(_ series: [CompareSeries]) -> some View {
         let nonEmpty = series.filter { !$0.rows.isEmpty }
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
-            SectionHeader("Overlay", overline: range.phrase)
+            SectionHeader("Overlay", overline: "\(range.phrase)")
             ChartCard(
                 title: "Normalized overlay",
                 subtitle: anyWidened

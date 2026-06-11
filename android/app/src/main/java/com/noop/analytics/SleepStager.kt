@@ -71,6 +71,40 @@ object SleepStager {
     /** Assumed sample interval (seconds) when not inferable. */
     const val defaultIntervalS: Double = 60.0
 
+    // ── Daytime false-sleep guard (#90) ──────────────────────────────────────
+    //
+    // A long, still, sedentary daytime stretch (reading, a desk, a sofa) is gravity-
+    // indistinguishable from a real nap, so the gravity spine alone misclassifies it as
+    // sleep. The fix is NOT to drop daytime sleep — real naps are legitimate sessions —
+    // but to hold a window whose CENTER falls in the local daytime band to a stricter bar:
+    // it must be long enough to be a real nap AND show a genuine cardiac dip (a sedentary
+    // stretch keeps a near-baseline HR). Overnight windows are UNCHANGED. Mirrors Swift.
+
+    /** Local hour (inclusive) at which the stricter daytime bar begins. */
+    const val daytimeBandStartHour: Int = 11
+
+    /**
+     * Local hour (exclusive) at which the stricter daytime bar ends. A window whose center
+     * is in [start, end) local hours is "daytime"; everything else is "overnight".
+     */
+    const val daytimeBandEndHour: Int = 20
+
+    /**
+     * A daytime window must run at least this long (minutes) to count — short still daytime
+     * stretches are the dominant false-positive and are rejected outright.
+     */
+    const val daytimeMinSleepMin: Int = 90
+
+    /**
+     * A daytime window's resting HR (lowest 5-min rolling mean) must be at or below
+     * baseline × this to confirm a real cardiac dip. Stricter than the overnight 1.05:
+     * a true nap dips BELOW the waking-day median, sedentary stillness does not.
+     */
+    const val daytimeRestingHRMult: Double = 0.95
+
+    /** Seconds in a calendar day (for local-hour-of-day arithmetic). */
+    const val secondsPerDay: Long = 86_400L
+
     /** Floor on the rolling-window size in samples. */
     const val minWindowSamples: Int = 3
 
@@ -277,17 +311,55 @@ object SleepStager {
         return meanHR <= baseline * hrSleepBaselineMult
     }
 
+    /**
+     * True when the run's CENTER, shifted to LOCAL time by [tzOffsetSeconds], lands in the
+     * daytime band [daytimeBandStartHour, daytimeBandEndHour). The center (not the edges) is
+     * used so a window straddling a band edge is classified once, by where it mostly is.
+     * Math.floorMod keeps the local-shifted time in [0, secondsPerDay) for any sign.
+     */
+    internal fun isDaytimeCenter(p: Period, tzOffsetSeconds: Long): Boolean {
+        val center = p.start + (p.end - p.start) / 2
+        val secOfDay = Math.floorMod(center + tzOffsetSeconds, secondsPerDay)
+        val hour = (secOfDay / 3_600L).toInt()
+        return hour >= daytimeBandStartHour && hour < daytimeBandEndHour
+    }
+
+    /**
+     * Stricter bar for a daytime-centered window (#90). A real daytime nap clears it; a long
+     * sedentary still stretch (the false-positive this guards) does not, because it is either
+     * too short or never shows a genuine cardiac dip below the day median. Overnight windows
+     * never reach here. Returns true = keep, false = reject.
+     *
+     * [restingHR] is the window's own lowest 5-min rolling-mean HR (the sleep-depth proxy
+     * detectSleep already computes); [baseline] is the day's median HR. With no usable HR
+     * evidence (null baseline OR null restingHR) a daytime stretch cannot be confirmed as a
+     * real nap, so it is rejected — sedentary daytime stillness without a measured HR dip is
+     * far more likely than an unmonitored nap, and this path can never touch the night.
+     */
+    internal fun passesDaytimeGuard(p: Period, restingHR: Int?, baseline: Double?): Boolean {
+        val daytimeMinSleepS = (daytimeMinSleepMin * 60).toLong()
+        if ((p.end - p.start) < daytimeMinSleepS) return false
+        if (baseline == null || restingHR == null) return false
+        return restingHR.toDouble() <= baseline * daytimeRestingHRMult
+    }
+
     // ── detectSleep (public) ──────────────────────────────────────────────────
 
     /**
      * Detect sleep sessions from biometric streams. Empty/absent gravity → [].
      * Gravity-only input degrades gracefully (HR/RR/resp refinements skipped).
+     *
+     * [tzOffsetSeconds] is the wall-clock UTC offset (TimeZone.getDefault().getOffset)
+     * used ONLY to place each window's center on a LOCAL clock for the daytime false-sleep
+     * guard (#90). It defaults to 0 so the pure function and its tests stay UTC; the live
+     * call site (IntelligenceEngine) passes the device's real offset.
      */
     fun detectSleep(
         hr: List<HrSample> = emptyList(),
         rr: List<RrInterval> = emptyList(),
         resp: List<RespSample> = emptyList(),
         gravity: List<GravitySample>,
+        tzOffsetSeconds: Long = 0L,
     ): List<DetectedSleep> {
         val grav = gravity.sortedBy { it.ts }
         if (grav.size < 2) return emptyList()
@@ -309,10 +381,14 @@ object SleepStager {
             if (p.stage != "sleep") continue
             if ((p.end - p.start) <= minSleepS) continue
             if (!confirmSleepWithHR(p, hrS, baseline)) continue
+            // Daytime false-sleep guard (#90): a window centered in the local daytime band
+            // must clear a stricter bar (≥daytimeMinSleepMin AND a real resting-HR dip).
+            // Overnight windows skip this entirely. restingHR is computed here (reused below).
+            val resting = sessionRestingHR(start = p.start, end = p.end, hr = hrS)
+            if (isDaytimeCenter(p, tzOffsetSeconds) && !passesDaytimeGuard(p, resting, baseline)) continue
             val stages = stageSession(start = p.start, end = p.end, grav = grav,
                 hr = hrS, rr = rrS, resp = respS)
             val eff = efficiency(start = p.start, end = p.end, stages = stages)
-            val resting = sessionRestingHR(start = p.start, end = p.end, hr = hrS)
             val avgHrv = sessionAvgHRV(start = p.start, end = p.end, rr = rrS)
             sessions.add(
                 DetectedSleep(
@@ -644,6 +720,144 @@ object SleepStager {
         val rate = 60.0 / HrvAnalyzer.median(intervals)
         val rrv = standardDeviation(intervals) // population std (numpy default)
         return Pair(rate, rrv)
+    }
+
+    // ── Respiration rate from R-R (RSA) — WHOOP5 on-wire path ────────────────
+
+    /** RSA tachogram resample rate (Hz). 4 Hz is the standard HRV resample grid. */
+    private const val rsaResampleHz: Double = 4.0
+
+    /** Moving-mean detrend window for the RSA tachogram (seconds). */
+    private const val rsaDetrendWindowS: Double = 8.0
+
+    /** Minimum spacing between breath peaks on the tachogram (seconds) → ≤24 bpm. */
+    private const val rsaMinPeakDistanceS: Double = 2.5
+
+    /** Per-window length for the per-window rate estimate (seconds). */
+    private const val rsaWindowS: Double = 300.0
+
+    /** Physiologic breath-interval band (seconds): 0.1–0.4 Hz = 6–24 breaths/min. */
+    private const val rsaMinBreathIntervalS: Double = 2.5  // 24 bpm
+    private const val rsaMaxBreathIntervalS: Double = 10.0 // 6 bpm
+
+    /**
+     * THE canonical plausible sleeping-respiratory-rate band (bpm). The RSA peak-pick above can yield
+     * 6–8 bpm at its noise floor, but every consumer (ReadinessEngine illness/readiness) only acts on
+     * 8–25 — so a sub-8 estimate used to be persisted-then-silently-ignored. respRateFromRR now clamps
+     * its output to this band (NaN outside it), and ReadinessEngine references this same range, so the
+     * stored value can never disagree with what's acted on. (#78) */
+    val respPlausibleRangeBpm: ClosedFloatingPointRange<Double> = 8.0..25.0
+
+    /**
+     * APPROXIMATE respiratory rate (breaths/min) from the R-R interval stream via
+     * respiratory sinus arrhythmia (RSA), for use when no raw resp ADC channel is
+     * available (WHOOP5 v18 wire is RR-only; resp ADC is WHOOP4 / cloud-only).
+     *
+     * This is an ON-DEVICE ESTIMATE, NOT a cloud/clinical respiration measurement.
+     * It recovers the breathing-modulation of beat-to-beat timing, which tracks but
+     * does not equal a chest-band / capnography rate.
+     *
+     * Pipeline (per matched in-bed session [start, end], unix SECONDS):
+     *   1. Restrict RR rows to ts in [start, end]; range-filter the RR values
+     *      (HrvAnalyzer.rangeFilter) to drop dropouts/ectopics.
+     *   2. Reconstruct beat times by cumulatively summing the kept RR intervals
+     *      from the first in-bed beat, yielding an (irregular) tachogram
+     *      t_k = Σ rr, value_k = rr_k (ms).
+     *   3. Resample the tachogram onto a uniform ~4 Hz grid by linear interpolation.
+     *   4. Detrend: subtract a centered moving mean (rsaDetrendWindowS).
+     *   5. Per ~5-min window: findPeaks (min distance rsaMinPeakDistanceS) on the
+     *      detrended grid, keep peak-to-peak intervals in the 6–24 bpm band, rate =
+     *      60 / median(intervals). Take the median across windows.
+     * Returns NaN when too few intervals survive (honest no-data).
+     */
+    internal fun respRateFromRR(rr: List<RrInterval>, start: Long, end: Long): Double {
+        val nan = Double.NaN
+        if (end <= start) return nan
+
+        // 1. In-bed RR rows in chronological order, range-filtered.
+        val inBed = rr.asSequence()
+            .filter { it.ts in start..end }
+            .sortedBy { it.ts }
+            .map { it.rrMs.toDouble() }
+            .toList()
+        val filtered = HrvAnalyzer.rangeFilter(inBed)
+        if (filtered.size < 30) return nan // need enough beats for any RSA estimate
+
+        // 2. Reconstruct beat times (seconds from session start) by cumulative sum.
+        val beatTimes = DoubleArray(filtered.size)
+        var acc = 0.0
+        for (i in filtered.indices) {
+            acc += filtered[i] / 1000.0
+            beatTimes[i] = acc
+        }
+        val totalSpanS = beatTimes[beatTimes.size - 1]
+        if (totalSpanS < rsaWindowS / 2.0) return nan // < ~2.5 min of beats
+
+        // 3. Resample onto a uniform grid by linear interpolation.
+        val dt = 1.0 / rsaResampleHz
+        val nGrid = (totalSpanS / dt).toInt() + 1
+        if (nGrid < 8) return nan
+        val grid = DoubleArray(nGrid)
+        var seg = 0
+        for (g in 0 until nGrid) {
+            val t = g * dt
+            // advance segment so beatTimes[seg] <= t <= beatTimes[seg+1]
+            while (seg < beatTimes.size - 2 && beatTimes[seg + 1] < t) seg += 1
+            val t0 = beatTimes[seg]
+            val t1 = beatTimes[seg + 1]
+            val v0 = filtered[seg]
+            val v1 = filtered[seg + 1]
+            grid[g] = if (t1 <= t0) v0 else {
+                val frac = ((t - t0) / (t1 - t0)).coerceIn(0.0, 1.0)
+                v0 + frac * (v1 - v0)
+            }
+        }
+
+        // 4. Detrend: subtract a centered moving mean (removes slow LF/baseline drift).
+        val halfW = maxOf(1, (rsaDetrendWindowS * rsaResampleHz / 2.0).roundToInt())
+        val detrended = DoubleArray(nGrid)
+        for (i in 0 until nGrid) {
+            val lo = maxOf(0, i - halfW)
+            val hi = minOf(nGrid - 1, i + halfW)
+            var sum = 0.0
+            for (j in lo..hi) sum += grid[j]
+            val mean = sum / (hi - lo + 1).toDouble()
+            detrended[i] = grid[i] - mean
+        }
+        if (standardDeviation(detrended.toList()) <= 1e-9) return nan // flat → no RSA
+
+        // 5. Per ~5-min window peak-pick → 60/median(breath interval); median across.
+        val minDistSamples = maxOf(2, (rsaMinPeakDistanceS * rsaResampleHz).roundToInt())
+        val windowSamples = maxOf(minDistSamples * 3, (rsaWindowS * rsaResampleHz).roundToInt())
+        val perWindowRates = ArrayList<Double>()
+        var w = 0
+        while (w < nGrid) {
+            val wEnd = minOf(nGrid, w + windowSamples)
+            if (wEnd - w >= minDistSamples * 3) {
+                val winSeg = ArrayList<Double>(wEnd - w)
+                for (k in w until wEnd) winSeg.add(detrended[k])
+                // findPeaks with height = 0.0 selects the positive RSA peaks (one per
+                // breath) on the zero-mean detrended tachogram.
+                val peaks = findPeaks(winSeg, distance = minDistSamples, height = 0.0)
+                if (peaks.size >= 3) {
+                    val intervals = ArrayList<Double>(peaks.size - 1)
+                    for (i in 1 until peaks.size) {
+                        val ivS = (peaks[i] - peaks[i - 1]).toDouble() * dt
+                        if (ivS in rsaMinBreathIntervalS..rsaMaxBreathIntervalS) intervals.add(ivS)
+                    }
+                    if (intervals.size >= 2) {
+                        val med = HrvAnalyzer.median(intervals)
+                        if (med > 0.0) perWindowRates.add(60.0 / med)
+                    }
+                }
+            }
+            w += windowSamples
+        }
+        if (perWindowRates.isEmpty()) return nan
+        // Reject estimates outside the canonical consumer band (NaN = "no usable estimate") so the
+        // persisted value never silently disagrees with ReadinessEngine's plausibility gate. (#78)
+        val median = HrvAnalyzer.median(perWindowRates)
+        return if (median in respPlausibleRangeBpm) median else nan
     }
 
     /**

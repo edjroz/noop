@@ -1,12 +1,14 @@
 package com.noop.ble
 
 import android.content.Context
+import com.noop.data.StreamBatch
 import com.noop.data.WhoopRepository
 import com.noop.protocol.DeviceFamily
 import com.noop.protocol.Framing
 import com.noop.protocol.HistoricalMeta
 import com.noop.protocol.classifyHistoricalMeta
 import com.noop.protocol.extractHistoricalStreams
+import com.noop.protocol.rejectedHistoricalRecords
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -34,10 +36,13 @@ import kotlinx.coroutines.sync.withLock
  * never reordered, matching the Swift serial-drain task. The owning [WhoopBleClient] feeds frames
  * in arrival order from a single drain coroutine.
  *
- * RAW CAPTURE: the Swift Backfiller optionally persists raw frames (research toggle, default OFF).
- * The Android data layer has no raw-frame outbox table, so raw persistence is intentionally omitted
+ * RAW CAPTURE: the Swift Backfiller optionally persists ALL raw frames (research toggle, default OFF);
+ * the Android data layer has no raw-frame outbox table, so that bulk capture is intentionally omitted
  * here — decoded rows are the product of record and are still durably committed before the trim is
- * advanced, exactly as in the Swift default (raw-off) configuration. See the FLAG in the port notes.
+ * advanced, exactly as in the Swift default (raw-off) configuration. The ONE exception is the
+ * undecodable-record archive (#77 / #91): record frames that fail decode are persisted via
+ * [rejectedSink] BEFORE the trim is acked, because the strap frees acked history and those bytes would
+ * otherwise be the user's permanently-lost only copy. See the FLAG in the port notes.
  */
 class Backfiller(
     private val repository: WhoopRepository,
@@ -50,6 +55,30 @@ class Backfiller(
      */
     private val ackTrim: (trim: Long, endData: ByteArray) -> Unit,
     /**
+     * Fires after a chunk's decoded rows are durably committed AND acked — i.e. real new data just
+     * landed. Lets the client schedule on-device scoring right away instead of leaving fresh history
+     * invisible until the next 15-min analysis tick. Empty chunks (metadata-only ENDs) don't fire.
+     * (#78 fork)
+     */
+    private val onChunkCommitted: (StreamBatch) -> Unit = {},
+    /**
+     * Diagnostic sink into the strap log. Lets [finishChunk] surface a chunk that arrived with frames
+     * but decoded to ZERO rows — the otherwise-invisible silent-data-loss case (frames failing CRC /
+     * an unmapped layout are dropped, the chunk looks empty, the trim acks past them). Without this a
+     * "zero data" strap log shows healthy "acked chunk" lines while data is being discarded (#77). */
+    private val log: (String) -> Unit = {},
+    /**
+     * Durable archive for HISTORICAL_DATA record frames that FAILED decode, called BEFORE the chunk
+     * is acked. The strap frees acked history, so these raw bytes are the user's ONLY remaining copy
+     * of an unmapped firmware's records — archiving them preserves the data for a later release that
+     * maps the layout AND provides the corpus that mapping needs (#77 / #91). Return false ONLY when
+     * the archive could not be made durable (a write failure — NOT the archive-full case): finishChunk
+     * then does NOT advance the cursor or ack, so the strap keeps the records and re-sends them (same
+     * invariant as a failed repository insert). The default keeps old behaviour for tests/callers that
+     * do not wire an archive (no archive → nothing to preserve → proceed).
+     */
+    private val rejectedSink: (frames: List<ByteArray>, trim: Long) -> Boolean = { _, _ -> true },
+    /**
      * The (device, wall) clock reference. type-47 records carry their OWN real unix timestamp so
      * the offset is a no-op for them; this is supplied only for the REALTIME_RAW_DATA fallback and
      * to mirror the Swift signature. Defaults to an identity ref (device == wall == now): the Swift
@@ -57,8 +86,15 @@ class Backfiller(
      * correct wall time. Settable by [WhoopBleClient] if a real correlation lands.
      */
     var clockRef: ClockRef = ClockRef.identityNow(),
-    private val family: DeviceFamily = DeviceFamily.WHOOP4,
 ) {
+
+    /**
+     * Strap family for the CURRENT offload, set at [begin] — drives the family-aware frame parse
+     * (5/MG inner record is +4) and the +4 end_data slice. The Backfiller is constructed once at
+     * client init (before the family is known), so this is settable per-offload rather than a
+     * constructor arg. Mirrors Swift `Backfiller.family` set in `begin(family:)`. (#78)
+     */
+    private var family: DeviceFamily = DeviceFamily.WHOOP4
 
     /** True while a historical offload session is active. */
     @Volatile
@@ -83,7 +119,8 @@ class Backfiller(
      * HISTORY_START then repeated HISTORY_ENDs, so we must accumulate from the outset.
      * Port of Swift `begin()`.
      */
-    fun begin() {
+    fun begin(family: DeviceFamily = DeviceFamily.WHOOP4) {
+        this.family = family
         isBackfilling = true
         synchronized(chunkLock) {
             chunk.clear()
@@ -127,7 +164,7 @@ class Backfiller(
      * this END become the next chunk. An END with no records is still acked (advances the trim).
      */
     private suspend fun finishChunk(unix: Long, trim: Long, endFrame: ByteArray) {
-        val endData = endData(endFrame) ?: return
+        val endData = endData(endFrame, family) ?: return
 
         val frames = synchronized(chunkLock) {
             val snapshot = ArrayList(chunk)
@@ -135,11 +172,40 @@ class Backfiller(
             snapshot
         }
 
+        var committed: StreamBatch? = null
         if (frames.isNotEmpty()) {
             val ref = clockRef
             val decoded = extractHistoricalStreams(frames, ref.device, ref.wall, family)
+            // #77 / #91: HISTORICAL_DATA record frames that fail decode (CRC failure, or an unmapped
+            // layout the v24 fallback's plausibility gate also rejects) used to be acked anyway — the
+            // strap trims acked history, so the user's ONLY copy of those records was permanently
+            // destroyed while the UI reported "History synced". Classify PER FRAME (a type-50 console
+            // frame decodes to 0 rows BY DESIGN and must not raise the alarm — the old chunk-level
+            // isEmpty check counted it and could waste the hex sample on it; it also missed mixed chunks
+            // where one good row hid the losses). Archive the rejects durably FIRST, and only then allow
+            // the ack below. The WHOOP4 happy path (zero rejects) is unchanged.
+            val rejected = rejectedHistoricalRecords(frames, family)
+            if (rejected.isNotEmpty()) {
+                log(
+                    "Backfill: WARNING ${rejected.size} record frame(s) decoded to 0 rows " +
+                        "(trim=$trim) — archiving raw bytes before ack (CRC/unmapped layout)",
+                )
+                // #91: a hex sample in the strap log so an unmapped firmware's record layout can be
+                // mapped from a shared log — now guaranteed to be actual record frames, not console text.
+                rejected.take(3).forEachIndexed { i, f ->
+                    val hex = f.take(64).joinToString("") { "%02x".format(it) }
+                    log("Backfill: rejected frame[$i] ${f.size}B: $hex${if (f.size > 64) "…" else ""}")
+                }
+                // Archive must be durable BEFORE the ack. A false return means a genuine write failure
+                // (NOT the archive-full case, which returns true) — hold the cursor/ack so the strap
+                // re-sends the chunk on the next offload. No data loss either way.
+                if (!rejectedSink(rejected, trim)) {
+                    return
+                }
+            }
             try {
                 repository.insert(decoded, deviceId) // DECODED FIRST (durable)
+                committed = decoded
             } catch (t: Throwable) {
                 return // do NOT advance/ack — chunk was never durably committed
             }
@@ -155,6 +221,7 @@ class Backfiller(
         }
 
         ackTrim(trim, endData)
+        committed?.takeIf { !it.isEmpty }?.let(onChunkCommitted)
     }
 
     /**
@@ -174,15 +241,16 @@ class Backfiller(
         const val STRAP_TRIM_CURSOR = "strap_trim"
 
         /**
-         * The 8-byte `end_data` the high-freq-sync ack requires: metadata.data[10:18].
-         * metadata.data begins at frame[7] (after [type,seq,cmd]), so end_data = frame[17:25].
-         * The trim cursor is the first u32 of end_data (data[10:14]). Returns null if the frame is
-         * too short (a real HISTORY_END is >= 14 data bytes; this guards a malformed frame).
-         * Port of Swift `Backfiller.endData(from:)`.
+         * The 8-byte `end_data` the high-freq-sync ack requires: metadata.data[10:18]. The inner
+         * record begins at frame[7] on WHOOP4 (end_data = frame[17:25]) and at frame[11] on WHOOP5/MG
+         * (the +4 puffin envelope → end_data = frame[21:29]). The trim cursor is the first u32 of
+         * end_data. Returns null if the frame is too short. Verified against a real WHOOP5 HISTORY_END
+         * (trim=112193 at frame[21:25]); port of Swift `Backfiller.endData(from:family:)`. (#78)
          */
-        fun endData(frame: ByteArray): ByteArray? {
-            if (frame.size < 25) return null
-            return frame.copyOfRange(17, 25)
+        fun endData(frame: ByteArray, family: DeviceFamily): ByteArray? {
+            val start = if (family == DeviceFamily.WHOOP5) 21 else 17
+            if (frame.size < start + 8) return null
+            return frame.copyOfRange(start, start + 8)
         }
     }
 }

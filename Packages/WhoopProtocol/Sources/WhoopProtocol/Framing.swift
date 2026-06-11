@@ -181,13 +181,52 @@ public func frameFromPayload(_ data: [UInt8], type: UInt8, seq: UInt8 = 0, cmd: 
     return frame
 }
 
+/// EXPERIMENTAL: build a WHOOP 5.0/MG ("puffin") command frame in the CRC16 envelope (docs/PROTOCOL.md
+/// §2.2). The inner record is `[type][seq][cmd] + payload`; `declLen = innerLen + 4` (the CRC32 tail);
+/// the CRC16-Modbus covers the first six header bytes. `type` defaults to 35 (COMMAND) and `header`
+/// to `[0x00, 0x01]`, mirroring the structure of the only puffin frame we know a real strap accepts
+/// (the static CLIENT_HELLO). The returned frame round-trips through `verifyFrame(_:family:.whoop5)`.
+/// Whether a 5/MG strap *acts* on a given command is exactly what experimentation discovers, so the
+/// app gates any sending behind an opt-in switch and only writes to the puffin command characteristic.
+public func puffinCommandFrame(cmd: UInt8, seq: UInt8, payload: [UInt8] = [0x00],
+                               type: UInt8 = 35, header: [UInt8] = [0x00, 0x01]) -> [UInt8] {
+    // Pad the inner record to a 4-byte boundary before length/CRC, exactly as the strap's maverick
+    // framing does (pad4). No-op for the 4-aligned commands shipped so far (toggle HR, historical),
+    // but REQUIRED for the 12-byte haptics payload (inner 15 → 16) — otherwise the declared length and
+    // CRC32 cover the wrong byte count and the strap rejects the frame (#48).
+    var inner: [UInt8] = [type, seq, cmd] + payload
+    let pad = (4 - inner.count % 4) % 4
+    if pad > 0 { inner += [UInt8](repeating: 0, count: pad) }
+    let declLen = inner.count + 4
+    var frame: [UInt8] = [0xAA, 0x01,
+                          UInt8(declLen & 0xFF), UInt8((declLen >> 8) & 0xFF),
+                          header[0], header[1]]
+    let c16 = crc16Modbus(Array(frame[0..<6]))
+    frame.append(UInt8(c16 & 0xFF)); frame.append(UInt8((c16 >> 8) & 0xFF))
+    frame.append(contentsOf: inner)
+    let c32 = crc32(inner)
+    frame.append(UInt8(c32 & 0xFF)); frame.append(UInt8((c32 >> 8) & 0xFF))
+    frame.append(UInt8((c32 >> 16) & 0xFF)); frame.append(UInt8((c32 >> 24) & 0xFF))
+    return frame
+}
+
 /// Accumulate BLE notification fragments into complete frames.
 /// A complete frame is `length + 4` bytes where length = u16 LE at buf[1..3].
 /// Mirrors framing.py Reassembler.
 public final class Reassembler {
     private var buf: [UInt8] = []
+    private let family: DeviceFamily
 
-    public init() {}
+    /// `family` selects the frame-length convention:
+    /// - WHOOP 4.0 reads a u16 length at `buf[1..3]`, total = `length + 4`.
+    /// - WHOOP 5.0 ("puffin") reads a u16 declared length at `buf[2..4]` (after the `0xAA` SOF and
+    ///   the `0x01` format byte), total = `declLength + 8` — the extra 4 covers the format byte and
+    ///   the CRC16 header that 5.0 inserts ahead of the inner record.
+    ///
+    /// Defaults to `.whoop4` so existing callers and tests are byte-for-byte unchanged.
+    public init(family: DeviceFamily = .whoop4) {
+        self.family = family
+    }
 
     public func feed(_ fragment: [UInt8]) -> [[UInt8]] {
         buf.append(contentsOf: fragment)
@@ -200,11 +239,17 @@ public final class Reassembler {
             if sof > 0 {
                 buf.removeFirst(sof)
             }
+            // Both families need at least 4 bytes to read their declared length.
             if buf.count < 4 {
                 break
             }
-            let length = Int(buf[1]) | (Int(buf[2]) << 8)
-            let total = length + 4
+            let total: Int
+            switch family {
+            case .whoop4:
+                total = (Int(buf[1]) | (Int(buf[2]) << 8)) + 4
+            case .whoop5:
+                total = (Int(buf[2]) | (Int(buf[3]) << 8)) + 8
+            }
             if buf.count < total {
                 break
             }

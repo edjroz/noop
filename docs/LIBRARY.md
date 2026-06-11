@@ -19,7 +19,7 @@ independently of the reference macOS app.
 
 ## Credits
 
-These packages build on prior open-source reverse-engineering and
+These packages build on prior community reverse-engineering and
 interoperability work:
 
 - **`johnmiddleton12/my-whoop`** — the WHOOP 4.0 BLE framing, command/decode,

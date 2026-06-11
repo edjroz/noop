@@ -1,8 +1,12 @@
 package com.noop.ui
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -19,6 +23,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CalendarMonth
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.GraphicEq
@@ -55,7 +60,11 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.noop.notif.CallAlertController
+import com.noop.notif.CallAlertSource
+import java.util.Calendar
 
 // MARK: - NotificationsSettingsScreen
 //
@@ -74,7 +83,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 // MARK: - Domain model (mirrors NotificationSettingsStore.swift)
 
 /** Haptic pattern fired on the strap; only the repeat count varies. */
-private enum class BuzzPattern(val label: String, val loops: Int) {
+internal enum class BuzzPattern(val label: String, val loops: Int) {
     Single("Single", 1),
     Double("Double", 2),
     Triple("Triple", 3),
@@ -82,7 +91,7 @@ private enum class BuzzPattern(val label: String, val loops: Int) {
 }
 
 /** Grouping for the settings screen, with its header icon + default pattern. */
-private enum class NotifCategory(
+internal enum class NotifCategory(
     val title: String,
     val icon: ImageVector,
     val defaultPattern: BuzzPattern,
@@ -94,7 +103,7 @@ private enum class NotifCategory(
 }
 
 /** A notification-capable app NOOP can mirror to the wrist. `id` is the persistence key. */
-private data class NotifApp(
+internal data class NotifApp(
     val id: String,
     val name: String,
     val category: NotifCategory,
@@ -131,13 +140,17 @@ private val activeCategories: List<NotifCategory> =
  * non-secret toggles). Per-app prefs are flattened to `app.<id>.enabled` / `app.<id>.pattern`
  * keys so no JSON dependency is needed.
  */
-private object NotifPrefs {
+internal object NotifPrefs {
     private const val FILE = "noop_notif_prefs"
     const val MASTER = "notif.masterEnabled"
     const val WORN = "notif.onlyWhenWorn"
     const val QUIET = "notif.quietHoursEnabled"
     const val QUIET_START = "notif.quietStartMinutes"
     const val QUIET_END = "notif.quietEndMinutes"
+    const val CALLS_MASTER = "notif.calls.masterEnabled"
+    const val CALLS_PHONE = "notif.calls.phoneEnabled"
+    const val CALLS_VOIP = "notif.calls.voipEnabled"
+    const val CALLS_PATTERN = "notif.calls.pattern"
 
     private fun prefs(ctx: Context) =
         ctx.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -167,6 +180,33 @@ private object NotifPrefs {
 
     fun setAppPattern(ctx: Context, id: String, pattern: BuzzPattern) =
         prefs(ctx).edit().putString("app.$id.pattern", pattern.name).apply()
+
+    /** Buzz loop-count for [pkg] (for the notification listener; no NotifApp needed). Defaults to
+     *  Double if no per-app pattern was chosen. */
+    fun appLoops(ctx: Context, pkg: String): Int {
+        val name = prefs(ctx).getString("app.$pkg.pattern", null)
+        return BuzzPattern.entries.firstOrNull { it.name == name }?.loops ?: BuzzPattern.Double.loops
+    }
+
+    fun callPattern(ctx: Context): BuzzPattern {
+        val name = prefs(ctx).getString(CALLS_PATTERN, null)
+        return BuzzPattern.entries.firstOrNull { it.name == name } ?: BuzzPattern.Triple
+    }
+
+    fun setCallPattern(ctx: Context, pattern: BuzzPattern) =
+        prefs(ctx).edit().putString(CALLS_PATTERN, pattern.name).apply()
+
+    fun callLoops(ctx: Context): Int = callPattern(ctx).loops
+
+    fun inQuietHours(ctx: Context): Boolean {
+        if (!getBool(ctx, QUIET, false)) return false
+        val start = getInt(ctx, QUIET_START, 22 * 60)
+        val end = getInt(ctx, QUIET_END, 7 * 60)
+        val cal = Calendar.getInstance()
+        val now = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+        // Quiet window may wrap midnight (e.g. 22:00 -> 07:00).
+        return if (start <= end) now in start until end else (now >= start || now < end)
+    }
 }
 
 // MARK: - Screen
@@ -182,6 +222,18 @@ fun NotificationsSettingsScreen(vm: AppViewModel) {
     var quietHoursEnabled by remember { mutableStateOf(NotifPrefs.getBool(context, NotifPrefs.QUIET, false)) }
     var quietStartMinutes by remember { mutableStateOf(NotifPrefs.getInt(context, NotifPrefs.QUIET_START, 22 * 60)) }
     var quietEndMinutes by remember { mutableStateOf(NotifPrefs.getInt(context, NotifPrefs.QUIET_END, 7 * 60)) }
+    var callsEnabled by remember { mutableStateOf(NotifPrefs.getBool(context, NotifPrefs.CALLS_MASTER, false)) }
+    var phoneCallsEnabled by remember { mutableStateOf(NotifPrefs.getBool(context, NotifPrefs.CALLS_PHONE, false)) }
+    var voipCallsEnabled by remember { mutableStateOf(NotifPrefs.getBool(context, NotifPrefs.CALLS_VOIP, false)) }
+    var callsPattern by remember { mutableStateOf(NotifPrefs.callPattern(context)) }
+    var phonePermissionDenied by remember { mutableStateOf(false) }
+    val phonePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        phoneCallsEnabled = granted
+        phonePermissionDenied = !granted
+        NotifPrefs.setBool(context, NotifPrefs.CALLS_PHONE, granted)
+    }
 
     // Per-app enabled state, seeded from prefs so the UI is reactive within the session.
     val enabledState: SnapshotStateMap<String, Boolean> = remember {
@@ -242,6 +294,51 @@ fun NotificationsSettingsScreen(vm: AppViewModel) {
 
             DeliveryNote()
         }
+
+        CallsCard(
+            masterEnabled = masterEnabled,
+            callsEnabled = callsEnabled,
+            phoneCallsEnabled = phoneCallsEnabled,
+            voipCallsEnabled = voipCallsEnabled,
+            pattern = callsPattern,
+            bonded = live.bonded,
+            permissionDenied = phonePermissionDenied,
+            onCallsEnabled = {
+                callsEnabled = it
+                NotifPrefs.setBool(context, NotifPrefs.CALLS_MASTER, it)
+                if (!it) CallAlertController.stopAll()
+            },
+            onPhoneCallsEnabled = { value ->
+                if (!value) {
+                    phoneCallsEnabled = false
+                    phonePermissionDenied = false
+                    NotifPrefs.setBool(context, NotifPrefs.CALLS_PHONE, false)
+                    CallAlertController.stopSource(CallAlertSource.PHONE)
+                    return@CallsCard
+                }
+                val granted = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.READ_PHONE_STATE,
+                ) == PackageManager.PERMISSION_GRANTED
+                if (granted) {
+                    phoneCallsEnabled = true
+                    phonePermissionDenied = false
+                    NotifPrefs.setBool(context, NotifPrefs.CALLS_PHONE, true)
+                } else {
+                    phonePermissionLauncher.launch(Manifest.permission.READ_PHONE_STATE)
+                }
+            },
+            onVoipCallsEnabled = {
+                voipCallsEnabled = it
+                NotifPrefs.setBool(context, NotifPrefs.CALLS_VOIP, it)
+                if (!it) CallAlertController.stopSource(CallAlertSource.VOIP)
+            },
+            onPattern = {
+                callsPattern = it
+                NotifPrefs.setCallPattern(context, it)
+            },
+            onTest = { vm.buzz(loops = callsPattern.loops) },
+        )
 
         // MARK: Category cards
         activeCategories.forEach { cat ->
@@ -333,6 +430,84 @@ private fun strapPillTone(live: com.noop.ble.LiveState): StrandTone = when {
     live.connected -> StrandTone.Positive
     live.bonded -> StrandTone.Warning
     else -> StrandTone.Critical
+}
+
+@Composable
+private fun CallsCard(
+    masterEnabled: Boolean,
+    callsEnabled: Boolean,
+    phoneCallsEnabled: Boolean,
+    voipCallsEnabled: Boolean,
+    pattern: BuzzPattern,
+    bonded: Boolean,
+    permissionDenied: Boolean,
+    onCallsEnabled: (Boolean) -> Unit,
+    onPhoneCallsEnabled: (Boolean) -> Unit,
+    onVoipCallsEnabled: (Boolean) -> Unit,
+    onPattern: (BuzzPattern) -> Unit,
+    onTest: () -> Unit,
+) {
+    val contentAlpha = if (masterEnabled) 1f else Palette.disabledOpacity
+    AlertSection(
+        icon = Icons.Filled.Call,
+        title = "Calls",
+        blurb = "Tap your wrist for incoming phone calls and strict best-effort VoIP calls.",
+    ) {
+        Column(modifier = Modifier.alphaIf(contentAlpha)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Buzz on incoming calls", style = NoopType.body, color = Palette.textPrimary)
+                    Text(
+                        "Uses the same quiet-hours and worn-only rules.",
+                        style = NoopType.footnote,
+                        color = Palette.textTertiary,
+                    )
+                }
+                if (callsEnabled) {
+                    PatternMenu(pattern = pattern, enabled = masterEnabled, appName = "calls", onSelect = onPattern)
+                    TestIconButton(enabled = masterEnabled && bonded, appName = "calls", onClick = onTest)
+                }
+                NoopSwitch(
+                    checked = callsEnabled,
+                    onChange = onCallsEnabled,
+                    enabled = masterEnabled,
+                    label = "Buzz on incoming calls",
+                )
+            }
+            if (callsEnabled) {
+                RowDivider()
+                FormToggleRow(
+                    label = "Phone calls",
+                    help = "Needs Phone permission; NOOP never reads numbers or call logs.",
+                    checked = phoneCallsEnabled,
+                    enabled = masterEnabled,
+                    onChange = onPhoneCallsEnabled,
+                )
+                if (permissionDenied) {
+                    Text(
+                        "Phone permission was denied, so phone-call buzzing is off.",
+                        style = NoopType.footnote,
+                        color = Palette.statusCritical,
+                        modifier = Modifier.padding(top = 2.dp, bottom = 8.dp),
+                    )
+                }
+                RowDivider()
+                FormToggleRow(
+                    label = "VoIP calls",
+                    help = "Detects call-style notifications from known calling apps.",
+                    checked = voipCallsEnabled,
+                    enabled = masterEnabled,
+                    onChange = onVoipCallsEnabled,
+                )
+            }
+        }
+    }
 }
 
 // MARK: - Delivery note (Notification Access requirement + deep link)
@@ -577,11 +752,11 @@ private fun PillButton(label: String, icon: ImageVector, enabled: Boolean, onCli
     }
 }
 
-// MARK: - Quiet-hours time chip (TimePickerDialog → HH:mm)
+// MARK: - Time chip (TimePickerDialog → HH:mm). Reused by the Automations smart-alarm time too.
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun TimeChip(
+internal fun TimeChip(
     minutes: Int,
     accessibilityLabel: String,
     onPicked: (Int) -> Unit,
@@ -697,6 +872,7 @@ private fun FormToggleRow(
     label: String,
     help: String,
     checked: Boolean,
+    enabled: Boolean = true,
     onChange: (Boolean) -> Unit,
 ) {
     Row(
@@ -710,7 +886,7 @@ private fun FormToggleRow(
             Text(help, style = NoopType.footnote, color = Palette.textTertiary)
         }
         Spacer(Modifier.width(16.dp))
-        NoopSwitch(checked = checked, onChange = onChange, label = label)
+        NoopSwitch(checked = checked, onChange = onChange, enabled = enabled, label = label)
     }
 }
 

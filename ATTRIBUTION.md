@@ -4,7 +4,7 @@ Strand is an independent, unofficial, local-first macOS app. It is not affiliate
 with, endorsed by, or connected to WHOOP, Inc. "WHOOP" is used nominatively only to
 identify the hardware the app interoperates with.
 
-Strand builds on prior open-source reverse-engineering and interoperability work:
+Strand builds on prior community reverse-engineering and interoperability work:
 
 ## WHOOP 4.0 protocol + Swift packages
 - **`johnmiddleton12/my-whoop`** — the `WhoopProtocol` and `WhoopStore` Swift packages

@@ -53,6 +53,9 @@ interface WhoopDao {
     suspend fun insertSkinTemp(rows: List<SkinTempSample>): List<Long>
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertSteps(rows: List<StepSample>): List<Long>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertResp(rows: List<RespSample>): List<Long>
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
@@ -86,6 +89,24 @@ interface WhoopDao {
     )
     suspend fun hrSamples(deviceId: String, from: Long, to: Long, limit: Int): List<HrSample>
 
+    /** Downsampled HR for charting: mean bpm per [bucketSeconds]-wide bucket over [from, to],
+     *  keyed by the bucket start (floor(ts/bucket)*bucket). Aggregated in SQL so a 24h window
+     *  returns ~(to-from)/bucketSeconds rows, not every ~1 Hz sample. Mirrors macOS hrBuckets. */
+    @Query(
+        "SELECT (ts / :bucketSeconds) * :bucketSeconds AS bucket, AVG(bpm) AS avgBpm FROM hrSample " +
+            "WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
+            "GROUP BY ts / :bucketSeconds ORDER BY bucket ASC"
+    )
+    suspend fun hrBuckets(deviceId: String, from: Long, to: Long, bucketSeconds: Long): List<HrBucket>
+
+    /** Aggregate HR over a window (one indexed (deviceId,ts) range scan — no row materialisation,
+     *  no [hrSamples] LIMIT truncation). Backs the imported-workout HR fallback (#77). */
+    @Query(
+        "SELECT COUNT(*) AS n, AVG(bpm) AS avg, MAX(bpm) AS max FROM hrSample " +
+            "WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to"
+    )
+    suspend fun hrWindowStats(deviceId: String, from: Long, to: Long): HrWindowStats
+
     @Query(
         "SELECT * FROM rrInterval WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
             "ORDER BY ts ASC, rrMs ASC LIMIT :limit"
@@ -115,6 +136,12 @@ interface WhoopDao {
             "ORDER BY ts ASC LIMIT :limit"
     )
     suspend fun skinTempSamples(deviceId: String, from: Long, to: Long, limit: Int): List<SkinTempSample>
+
+    @Query(
+        "SELECT * FROM stepSample WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
+            "ORDER BY ts ASC LIMIT :limit"
+    )
+    suspend fun stepSamples(deviceId: String, from: Long, to: Long, limit: Int): List<StepSample>
 
     @Query(
         "SELECT * FROM respSample WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
@@ -171,6 +198,20 @@ interface WhoopDao {
     @Query("SELECT DISTINCT key FROM metricSeries WHERE deviceId = :deviceId ORDER BY key ASC")
     suspend fun metricKeys(deviceId: String): List<String>
 
+    // MARK: - One-time #34 refile: separate legacy Health Connect data from the Apple Health bucket.
+    // Only an Apple Health EXPORT writes metricSeries, so metricSeries-count==0 means the apple-health
+    // daily rows are Health-Connect-origin and safe to move. HC workouts are tagged source so they move
+    // unconditionally. Safe on first run: no `to` rows exist yet (no PK conflict), and post-#34 nothing
+    // ever writes HC data to apple-health again, so it's idempotent (re-runs match 0 rows).
+    @Query("SELECT COUNT(*) FROM metricSeries WHERE deviceId = :deviceId")
+    suspend fun metricSeriesCount(deviceId: String): Int
+
+    @Query("UPDATE appleDaily SET deviceId = :to WHERE deviceId = :from")
+    suspend fun reassignAppleDaily(from: String, to: String)
+
+    @Query("UPDATE workout SET deviceId = :to WHERE deviceId = :from AND source = :source")
+    suspend fun reassignWorkoutsBySource(from: String, to: String, source: String)
+
     // MARK: - Journal / workouts / Apple-Health reads (mirror JournalWorkoutAppleCache.swift, v8)
 
     /**
@@ -182,6 +223,14 @@ interface WhoopDao {
             "ORDER BY day ASC, question ASC"
     )
     suspend fun journal(deviceId: String, from: String, to: String): List<JournalEntry>
+
+    /**
+     * Delete one journal answer by natural key (the native logging card's "clear"). Source-scoped
+     * by deviceId, so clearing a native ("noop-journal") answer never removes an identical imported
+     * row. Port of JournalWorkoutAppleCache.swift deleteJournal(deviceId:day:question:).
+     */
+    @Query("DELETE FROM journal WHERE deviceId = :deviceId AND day = :day AND question = :question")
+    suspend fun deleteJournalEntry(deviceId: String, day: String, question: String)
 
     /**
      * Workouts whose startTs falls in [from, to] (unix seconds), oldest first, row-limited.
@@ -203,6 +252,26 @@ interface WhoopDao {
     )
     suspend fun appleDaily(deviceId: String, from: String, to: String): List<AppleDaily>
 
+    /** Delete a computed source's workouts of a given [sport] whose startTs is in [from, to]
+     *  (makes detected-workout re-derivation idempotent). (#78) */
+    @Query("DELETE FROM workout WHERE deviceId = :deviceId AND sport = :sport AND startTs >= :from AND startTs <= :to")
+    suspend fun deleteWorkoutsBySport(deviceId: String, sport: String, from: Long, to: Long)
+
+    /** Delete ONE workout by its full natural key (deviceId, startTs, sport). Used by the Workouts
+     *  screen to remove a single manual / re-labelled session. (#107) */
+    @Query("DELETE FROM workout WHERE deviceId = :deviceId AND startTs = :startTs AND sport = :sport")
+    suspend fun deleteWorkoutByKey(deviceId: String, startTs: Long, sport: String)
+
+    // MARK: - Dismissed detected bouts (durable #107 marker; survives engine re-detection)
+
+    /** Record a dismissed detected bout. IGNORE so re-dismissing the same bout is a no-op. */
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertDismissed(rows: List<DismissedWorkout>)
+
+    /** All dismissed markers for a [deviceId] (the computed "<id>-noop" source the detector writes). */
+    @Query("SELECT * FROM dismissedWorkout WHERE deviceId = :deviceId")
+    suspend fun dismissedWorkouts(deviceId: String): List<DismissedWorkout>
+
     // MARK: - Frontier / stats (Reads.swift)
 
     /** Max HR sample ts for a device, or null if none — the biometric data frontier. */
@@ -215,6 +284,7 @@ interface WhoopDao {
     @Query("SELECT COUNT(*) FROM battery") suspend fun countBattery(): Int
     @Query("SELECT COUNT(*) FROM spo2Sample") suspend fun countSpo2(): Int
     @Query("SELECT COUNT(*) FROM skinTempSample") suspend fun countSkinTemp(): Int
+    @Query("SELECT COUNT(*) FROM stepSample") suspend fun countSteps(): Int
     @Query("SELECT COUNT(*) FROM respSample") suspend fun countResp(): Int
     @Query("SELECT COUNT(*) FROM gravitySample") suspend fun countGravity(): Int
 

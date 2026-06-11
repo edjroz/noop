@@ -37,9 +37,9 @@ import kotlin.math.roundToInt
 // ChartCard, and a uniform set of HRV / Resting HR / Day-strain ChartCards (all
 // Metrics.chartHeight tall), followed by a recovery history strip.
 //
-// Windows are taken RELATIVE TO THE LATEST recorded day (not "now"), with the macOS
-// auto-expand rule: if the selected window holds zero points for a metric, the smallest
-// LARGER range that does is used and the card caption notes the widening.
+// Windows are taken relative to the phone's actual local day, with the macOS auto-expand
+// rule: if the selected window holds zero points for a metric, the smallest larger range
+// that does is used and the card caption notes the widening.
 //
 // Data: full history is loaded once via repo.days("my-whoop"); until it arrives the
 // reactive recentDays flow backs the charts, so the screen is never empty when data exists.
@@ -215,8 +215,14 @@ private fun windowValues(
     if (days.isEmpty()) return emptyList()
     val sliced = when (val n = range.days) {
         null -> days
-        // The history is already oldest-first; a trailing N-day window is the last N rows.
-        else -> days.takeLast(n)
+        // Trailing N CALENDAR days ending today — anchored to the phone's date, NOT the last N rows
+        // (which on a stale import made months-old data fill the W/M/3M windows, looking current — #23).
+        // ISO yyyy-MM-dd sorts chronologically. Empty short windows auto-widen via resolveMetric, so old
+        // imports surface under a wider range / All history rather than masquerading as recent.
+        else -> {
+            val cutoff = java.time.LocalDate.now().minusDays((n - 1).toLong()).toString()
+            days.filter { it.day >= cutoff }
+        }
     }
     return sliced.mapNotNull(value)
 }

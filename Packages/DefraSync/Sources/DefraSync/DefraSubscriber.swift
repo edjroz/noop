@@ -127,7 +127,9 @@ public actor DefraSubscriber {
                     exerciseCount: r["exerciseCount"] as? Int,
                     spo2Pct: r["spo2Pct"] as? Double,
                     skinTempDevC: r["skinTempDevC"] as? Double,
-                    respRateBpm: r["respRateBpm"] as? Double)
+                    respRateBpm: r["respRateBpm"] as? Double,
+                    steps: r["steps"] as? Int,
+                    activeKcalEst: r["activeKcalEst"] as? Double)
             }
             _ = try? await store.upsertDailyMetrics(mapped, deviceId: deviceId)
         case "journal":
@@ -184,7 +186,7 @@ public actor DefraSubscriber {
             return """
             naturalKey deviceId day totalSleepMin efficiency deepMin remMin lightMin disturbances \
             restingHr avgHrv recovery strain exerciseCount spo2Pct skinTempDevC respRateBpm \
-            lastWriterPeer lastWriterTs
+            steps activeKcalEst lastWriterPeer lastWriterTs
             """
         case DefraTypeName.journal:
             return "naturalKey deviceId day question answeredYes notes lastWriterPeer lastWriterTs"

@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 import StrandDesign
 import WhoopStore
 
@@ -15,11 +17,36 @@ struct SettingsView: View {
     @State private var backupAlertMessage = ""
     @State private var showBackupAlert = false
 
+    /// Opt-in WHOOP 5/MG protocol experiments (off by default). See [PuffinExperiment].
+    @AppStorage(PuffinExperiment.defaultsKey) private var puffinExperiments = false
+
+    /// Opt-in WHOOP 5/MG raw-frame capture to a file (off by default). See [PuffinFrameRecorder].
+    @AppStorage(PuffinFrameRecorder.enabledKey) private var puffinCapture = false
+
+    // Imperial/Metric display preference (D#103). Stored data is always SI; this only changes how
+    // distances/weights/heights/temperatures are SHOWN — and lets the profile fields below take
+    // imperial entry. Temperature has a separate override so °C/°F can be picked independently.
+    @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
+    @AppStorage(UnitPrefs.temperatureKey) private var temperatureRaw = ""
+    private var unitSystem: UnitSystem { UnitSystem(rawValue: unitSystemRaw) ?? .metric }
+    private var temperatureUnit: TemperatureUnit {
+        UnitPrefs.resolveTemperature(system: unitSystem, override: temperatureRaw)
+    }
+
+    /// "What's New" changelog sheet, reachable any time from About.
+    @State private var showWhatsNew = false
+
+    /// User-initiated GitHub release check behind the About "Check for updates" button.
+    @StateObject private var updateChecker = UpdateChecker()
+    @Environment(\.openURL) private var openURL
+
     var body: some View {
         ScreenScaffold(title: "Settings",
                        subtitle: "Your numbers, your strap, and how NOOP works. All on this Mac.") {
             profileCard
+            unitsCard
             strapCard
+            experimentalCard
             backupCard
             aboutCard
         }
@@ -27,6 +54,9 @@ struct SettingsView: View {
             Button("OK", role: .cancel) { }
         } message: {
             Text(backupAlertMessage)
+        }
+        .sheet(isPresented: $showWhatsNew) {
+            WhatsNewView(onClose: { showWhatsNew = false })
         }
     }
 
@@ -64,15 +94,25 @@ struct SettingsView: View {
                 }
                 rowDivider
                 FormRow(label: "Weight") {
-                    measureField(value: $profile.weightKg, unit: "kg",
-                                 range: 30...250, step: 0.5, format: "%.1f",
-                                 accessibility: "Weight in kilograms")
+                    // Imperial mode steps in pounds and stores the kg equivalent; metric steps in kg.
+                    if unitSystem == .imperial {
+                        poundsField(weightKg: $profile.weightKg)
+                    } else {
+                        measureField(value: $profile.weightKg, unit: "kg",
+                                     range: 30...250, step: 0.5, format: "%.1f",
+                                     accessibility: "Weight in kilograms")
+                    }
                 }
                 rowDivider
                 FormRow(label: "Height") {
-                    measureField(value: $profile.heightCm, unit: "cm",
-                                 range: 120...230, step: 1, format: "%.0f",
-                                 accessibility: "Height in centimetres")
+                    // Imperial mode steps in whole inches and stores the cm equivalent; metric steps in cm.
+                    if unitSystem == .imperial {
+                        feetInchesField(heightCm: $profile.heightCm)
+                    } else {
+                        measureField(value: $profile.heightCm, unit: "cm",
+                                     range: 120...230, step: 1, format: "%.0f",
+                                     accessibility: "Height in centimetres")
+                    }
                 }
                 rowDivider
                 FormRow(label: "Max heart rate") {
@@ -116,6 +156,48 @@ struct SettingsView: View {
         }
     }
 
+    /// Imperial weight entry: shows pounds, steps in 1-lb increments, and writes the kg equivalent back
+    /// to the SI-stored profile. Range mirrors the metric 30…250 kg (≈66…551 lb).
+    private func poundsField(weightKg: Binding<Double>) -> some View {
+        let lb = Binding<Double>(
+            get: { UnitFormatter.kgToPounds(weightKg.wrappedValue) },
+            set: { weightKg.wrappedValue = $0 / UnitFormatter.poundsPerKilogram }
+        )
+        return HStack(spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(String(format: "%.0f", lb.wrappedValue))
+                    .font(StrandFont.bodyNumber)
+                    .foregroundStyle(StrandPalette.textPrimary)
+                    .frame(minWidth: 48, alignment: .trailing)
+                Text("lb")
+                    .font(StrandFont.caption)
+                    .foregroundStyle(StrandPalette.textTertiary)
+            }
+            Stepper("Weight in pounds", value: lb, in: 66...551, step: 1)
+                .labelsHidden()
+                .accessibilityLabel("Weight, \(Int(lb.wrappedValue.rounded())) pounds")
+        }
+    }
+
+    /// Imperial height entry: shows feet′ inches″, steps in whole inches, and writes the cm equivalent
+    /// back to the SI-stored profile. Range mirrors the metric 120…230 cm (≈47…91 in).
+    private func feetInchesField(heightCm: Binding<Double>) -> some View {
+        let inches = Binding<Double>(
+            get: { UnitFormatter.cmToInches(heightCm.wrappedValue).rounded() },
+            set: { heightCm.wrappedValue = $0 * UnitFormatter.centimetersPerInch }
+        )
+        let parts = UnitFormatter.cmToFeetInches(heightCm.wrappedValue)
+        return HStack(spacing: 10) {
+            Text("\(parts.feet)′ \(parts.inches)″")
+                .font(StrandFont.bodyNumber)
+                .foregroundStyle(StrandPalette.textPrimary)
+                .frame(minWidth: 56, alignment: .trailing)
+            Stepper("Height in inches", value: inches, in: 47...91, step: 1)
+                .labelsHidden()
+                .accessibilityLabel("Height, \(parts.feet) feet \(parts.inches) inches")
+        }
+    }
+
     /// HR-max override: 0 = auto. Shown as a compact tabular value with a stepper.
     private var hrMaxField: some View {
         HStack(spacing: 10) {
@@ -132,6 +214,45 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Units
+
+    /// Imperial/Metric display toggle + a separate temperature override. Display-only — nothing stored
+    /// changes, NOOP keeps everything in SI and converts at the point of display.
+    private var unitsCard: some View {
+        SettingsSection(
+            icon: "ruler",
+            title: "Units",
+            blurb: "Choose how distances, weights, heights and temperatures are shown. Your data is always stored the same way — this only changes the display."
+        ) {
+            VStack(spacing: 0) {
+                FormRow(label: "Measurement system") {
+                    Picker("Measurement system", selection: $unitSystemRaw) {
+                        Text("Metric").tag(UnitSystem.metric.rawValue)
+                        Text("Imperial").tag(UnitSystem.imperial.rawValue)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .fixedSize()
+                    .accessibilityLabel("Measurement system")
+                }
+                rowDivider
+                FormRow(label: "Temperature") {
+                    // Three-way: "Match" follows the system above; °C / °F pin it explicitly. Stored as
+                    // an empty string ("match") or the TemperatureUnit raw value.
+                    Picker("Temperature", selection: $temperatureRaw) {
+                        Text("Match").tag("")
+                        Text("°C").tag(TemperatureUnit.celsius.rawValue)
+                        Text("°F").tag(TemperatureUnit.fahrenheit.rawValue)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .fixedSize()
+                    .accessibilityLabel("Temperature unit")
+                }
+            }
+        }
+    }
+
     // MARK: - Strap
 
     private var strapCard: some View {
@@ -142,9 +263,11 @@ struct SettingsView: View {
         ) {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(spacing: 12) {
-                    StatePill(strapStatusTitle, tone: strapTone, pulsing: live.connected)
+                    StatePill("\(strapStatusTitle)", tone: strapTone, pulsing: live.connected)
                     if let pct = live.batteryPct {
-                        StatePill("Battery \(Int(pct.rounded()))%",
+                        StatePill(live.charging == true
+                                  ? "Battery \(Int(pct.rounded()))% · Charging"
+                                  : "Battery \(Int(pct.rounded()))%",
                                   tone: batteryTone(pct), showsDot: false)
                     }
                     Spacer(minLength: 0)
@@ -193,6 +316,7 @@ struct SettingsView: View {
         if live.bonded && live.connected {
             return "Your strap is paired and sending data. Open Live for a real-time heart rate."
         }
+        if live.connected, let hint = live.pairingHint { return hint }
         if live.connected { return "Connected. Finishing the secure pairing handshake…" }
         if live.bonded { return "Previously paired but not currently connected. Re-scan to reconnect." }
         return "No strap connected. Put your WHOOP nearby and tap Re-scan to pair."
@@ -205,6 +329,97 @@ struct SettingsView: View {
     }
 
     // MARK: - Backup & restore
+
+    // MARK: - Experimental (WHOOP 5 / MG)
+
+    private var experimentalCard: some View {
+        SettingsSection(
+            icon: "flask.fill",
+            title: "Experimental · WHOOP 5 / MG",
+            blurb: "Live heart rate already works on a WHOOP 5/MG strap. These probes go further and try to coax more out of it. They are guesses, off by default, and only ever touch a 5/MG strap — WHOOP 4.0 is never affected."
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(isOn: $puffinExperiments) {
+                    Text("Try WHOOP 5/MG protocol probes")
+                        .font(StrandFont.subhead)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                }
+                .toggleStyle(.switch)
+                .tint(StrandPalette.accent)
+                Text("On a 5/MG connection NOOP will send a puffin realtime-stream request after the handshake, and log what comes back. If you have a 5/MG strap, turning this on and sharing your strap log helps map the protocol. No effect on WHOOP 4.0.")
+                    .font(StrandFont.caption)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Divider().overlay(StrandPalette.hairline)
+
+                Toggle(isOn: $puffinCapture) {
+                    Text("Record puffin frames to a file")
+                        .font(StrandFont.subhead)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                }
+                .toggleStyle(.switch)
+                .tint(StrandPalette.accent)
+                Text("Saves every raw 5/MG frame (with a timestamp and the live heart rate) to a JSON file you can share to help map the biometric layout. This only records frames the strap already sent — it never writes to your strap — so it is safe to leave on. Export the file and attach it to a protocol-mapping issue.")
+                    .font(StrandFont.caption)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if live.puffinCaptureCount > 0 {
+                    Text("\(live.puffinCaptureCount) frame\(live.puffinCaptureCount == 1 ? "" : "s") captured this session.")
+                        .font(StrandFont.caption)
+                        .foregroundStyle(StrandPalette.textSecondary)
+                    HStack(spacing: 12) {
+                        Button {
+                            exportPuffinCaptures()
+                        } label: {
+                            Label("Export frames…", systemImage: "square.and.arrow.up")
+                                .padding(.horizontal, 6)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(StrandPalette.accent)
+
+                        Button {
+                            revealPuffinCaptures()
+                        } label: {
+                            Label("Reveal in Finder", systemImage: "folder")
+                                .padding(.horizontal, 6)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(StrandPalette.accent)
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flush the in-flight capture, then copy it to a user-chosen location via a save panel.
+    private func exportPuffinCaptures() {
+        model.ble.flushPuffinCaptures()
+        guard let src = live.puffinCaptureURL else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = src.lastPathComponent
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let dest = panel.url else { return }
+        let fm = FileManager.default
+        do {
+            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            try fm.copyItem(at: src, to: dest)
+        } catch {
+            backupAlertTitle = "Export failed"
+            backupAlertMessage = error.localizedDescription
+            showBackupAlert = true
+        }
+    }
+
+    /// Flush, then reveal the capture file in Finder so the user can grab it directly.
+    private func revealPuffinCaptures() {
+        model.ble.flushPuffinCaptures()
+        guard let url = live.puffinCaptureURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
 
     private var backupCard: some View {
         SettingsSection(
@@ -234,6 +449,16 @@ struct SettingsView: View {
                     .tint(StrandPalette.accent)
                     .disabled(backupBusy)
 
+                    Button {
+                        runCsvExport()
+                    } label: {
+                        Label("Export CSV…", systemImage: "tablecells")
+                            .padding(.horizontal, 6)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(StrandPalette.accent)
+                    .disabled(backupBusy)
+
                     if backupBusy { ProgressView().controlSize(.small) }
                     Spacer(minLength: 0)
                 }
@@ -243,7 +468,7 @@ struct SettingsView: View {
                         .foregroundStyle(StrandPalette.textTertiary)
                         .font(.system(size: 13))
                         .accessibilityHidden(true)
-                    Text("Importing overwrites everything currently on this Mac. Your old data is kept in a side file just in case. NOOP needs a relaunch for an import to take effect.")
+                    Text("Importing overwrites everything currently on this Mac. Your old data is kept in a side file just in case. NOOP needs a relaunch for an import to take effect. Export CSV writes a WHOOP-format zip of your days, sleeps, workouts and journal that re-imports into NOOP on Mac or Android — on-device computed rows are marked APPROXIMATE in its Source column; the full backup stays the lossless restore path.")
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -265,6 +490,26 @@ struct SettingsView: View {
         Task {
             let result = await DataBackup.runImport()
             handleBackup(result)
+        }
+    }
+
+    private func runCsvExport() {
+        backupBusy = true
+        Task {
+            let result = await CsvExport.run(repo: model.repo)
+            backupBusy = false
+            switch result {
+            case .cancelled:
+                return
+            case .exported(let url):
+                backupAlertTitle = "CSV exported"
+                backupAlertMessage = "Saved to \(url.lastPathComponent). The zip re-imports into NOOP (Data Sources → WHOOP Export) on any Mac or Android device."
+                showBackupAlert = true
+            case .failure(let message):
+                backupAlertTitle = "Export problem"
+                backupAlertMessage = message
+                showBackupAlert = true
+            }
         }
     }
 
@@ -302,10 +547,92 @@ struct SettingsView: View {
                     Text("NOOP")
                         .font(StrandFont.title2)
                         .foregroundStyle(StrandPalette.textPrimary)
-                    StatePill("v0.1.0", tone: .neutral, showsDot: false)
+                    StatePill("v\(AppChangelog.currentVersion)", tone: .neutral, showsDot: false)
+                    Spacer()
+                    Button {
+                        showWhatsNew = true
+                    } label: {
+                        Label("What's new", systemImage: "sparkles").padding(.horizontal, 4)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(StrandPalette.accent)
                 }
 
-                Text("A standalone macOS companion for your WHOOP. Everything stays on this Mac — your history, your live stream, your numbers. Nothing is uploaded.")
+                // Check for updates — a single, user-initiated read of GitHub's public releases API.
+                // No background polling, no auto-update; sends nothing about you, just reads the version.
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        Button {
+                            updateChecker.check(currentVersion: AppChangelog.currentVersion)
+                        } label: {
+                            if updateChecker.state == .checking {
+                                HStack(spacing: 6) {
+                                    ProgressView().controlSize(.small)
+                                    Text("Checking…")
+                                }
+                            } else {
+                                Label("Check for updates", systemImage: "arrow.triangle.2.circlepath")
+                                    .padding(.horizontal, 4)
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(updateChecker.state == .checking)
+
+                        if case .upToDate(let v) = updateChecker.state {
+                            Text("You're on the latest (\(v)).")
+                                .font(StrandFont.footnote)
+                                .foregroundStyle(StrandPalette.textSecondary)
+                        } else if case .failed = updateChecker.state {
+                            Text("Couldn't check. Try again.")
+                                .font(StrandFont.footnote)
+                                .foregroundStyle(StrandPalette.statusWarning)
+                        }
+                        Spacer()
+                    }
+
+                    // Update available: show what's new, with a download straight to the release.
+                    if case .available(let v, let url, let notes) = updateChecker.state {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Version \(v) is available")
+                                    .font(StrandFont.subhead)
+                                    .foregroundStyle(StrandPalette.textPrimary)
+                                Spacer()
+                                Button {
+                                    openURL(url)
+                                } label: {
+                                    Label("Download", systemImage: "arrow.down.circle.fill")
+                                        .padding(.horizontal, 4)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(StrandPalette.accent)
+                            }
+                            if !notes.isEmpty {
+                                ScrollView {
+                                    Text(notes)
+                                        .font(StrandFont.footnote)
+                                        .foregroundStyle(StrandPalette.textSecondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .frame(maxHeight: 150)
+                            }
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(StrandPalette.surfaceInset,
+                                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .stroke(StrandPalette.accent.opacity(0.3), lineWidth: 1)
+                        )
+                    }
+
+                    Text("Checks GitHub for the latest version when you tap — nothing else is sent.")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                }
+
+                Text("A standalone companion for your WHOOP. Everything stays on this device — your history, your live stream, your numbers. Nothing is uploaded. NOOP is an independent, experimental project, not the WHOOP app.")
                     .font(StrandFont.subhead)
                     .foregroundStyle(StrandPalette.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -376,8 +703,8 @@ struct SettingsView: View {
 /// A grouped settings card: icon + title header, an explanatory blurb, then content.
 private struct SettingsSection<Content: View>: View {
     let icon: String
-    let title: String
-    let blurb: String
+    let title: LocalizedStringKey
+    let blurb: LocalizedStringKey
     @ViewBuilder var content: () -> Content
 
     var body: some View {
@@ -405,7 +732,7 @@ private struct SettingsSection<Content: View>: View {
 
 /// Label on the left, control on the right — the two-column form feel.
 private struct FormRow<Control: View>: View {
-    let label: String
+    let label: LocalizedStringKey
     @ViewBuilder var control: () -> Control
 
     var body: some View {

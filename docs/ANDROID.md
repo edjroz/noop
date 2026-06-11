@@ -37,6 +37,7 @@ and on-device data model, not a wrapper around the Swift code.
 - [What exists vs. what is missing](#what-exists-vs-what-is-missing)
 - [Build prerequisites](#build-prerequisites)
 - [Building](#building)
+- [Installing the APK (sideload & Play Protect)](#installing-the-apk-sideload--play-protect)
 - [The protocol module (Kotlin port of `WhoopProtocol`)](#the-protocol-module-kotlin-port-of-whoopprotocol)
 - [Android BLE layer](#android-ble-layer)
 - [Storage with Room](#storage-with-room)
@@ -216,6 +217,30 @@ adb shell am start -n com.noop.whoop.debug/com.noop.ui.MainActivity
 
 Open `android/` directly in Android Studio (**File ▸ Open ▸ android/**) and let Gradle sync; run
 the `app` configuration on a physical device.
+
+---
+
+## Installing the APK (sideload & Play Protect)
+
+The released `NOOP-full.apk` (and `NOOP-demo.apk`) is an **unsigned, source-available APK** — there
+is no Play Store listing, because the project is anonymous and has no paid Play identity to publish
+or sign under. That's deliberate, but it means Android treats NOOP as an "unknown app" and **Google
+Play Protect** may warn or block on install — most stubbornly on stock Pixel / recent Android.
+Nothing is wrong with the file; it's just missing a Play signature. To get it on:
+
+1. **Tap "Install anyway."** When the warning appears, choose **More details → Install anyway**.
+2. **If that button is missing** — it can vanish after a first install + uninstall — grant the source
+   directly: **Settings → Apps → Special app access → Install unknown apps → [the browser or file
+   manager you're installing from] → Allow from this source**, then reopen the APK.
+3. **If Play Protect still refuses**, it's your call for an unsigned app you trust: **Play Store →
+   profile icon → Play Protect → ⚙ Settings → "Scan apps with Play Protect" off**, install NOOP,
+   then switch it **back on**.
+4. **Reinstalling is safe.** The app sets `android:allowBackup="false"` and keeps everything in
+   private on-device storage, so uninstalling and reinstalling simply starts fresh — there's no cloud
+   copy to lose, and nothing leaves the device either way.
+
+The demo APK installs alongside the full app (distinct `applicationId`), so you can keep both; the
+same Play Protect prompts apply to each.
 
 ---
 
@@ -399,6 +424,34 @@ This is the **highest-risk** part of the port and the least validated. The macOS
 - **Strap must be out of range of the official app** during initial bonding, worn, and charged
   enough to report a non-zero heart rate.
 
+### Debugging the strap connection
+
+The BLE client keeps a running **strap log** of the connection's control flow — scan results,
+the bond/handshake state machine, every command sent (name + payload hex), and offload progress
+(trim cursors, chunk acks). It is the primary tool for **debugging and protocol development** on
+Android, and the same log is what users attach to bug reports.
+
+By default the log is kept **only** in an in-memory ring buffer (so a normal user never writes the
+connection log to the device-wide system log). To watch a session live while developing, turn the
+log on:
+
+1. In the app: **Settings → Strap → "Debug logging"** (off by default).
+2. Then tail it over adb, filtered to the BLE client tag:
+
+   ```bash
+   adb logcat -s WhoopBleClient
+   # e.g.
+   #   D WhoopBleClient: Discovered WHOOP 5AG… (rssi -52) — connecting
+   #   D WhoopBleClient: → TOGGLE_REALTIME_HR payload=01 (puffin)
+   #   D WhoopBleClient: Backfill: acked chunk trim=113681
+   #   D WhoopBleClient: Backfill: session ended — reason=HISTORY_COMPLETE
+   ```
+
+The toggle drives `WhoopBleClient.debugLogcat` (persisted as `NoopPrefs.KEY_DEBUG_LOGGING`); it
+gates only the `Log.d` call. Whether or not it is on, **Settings → Strap → "Share strap log"**
+exports the same in-app buffer to a file (the path for users with no adb). What the log does and
+does not contain — and why logcat is opt-in — is covered in `PRIVACY_SECURITY.md` §2.4.
+
 ---
 
 ## Storage with Room
@@ -576,7 +629,7 @@ against a real build, a real device, and a real strap.
 
 ## Credits
 
-The Android client re-implements protocol and behavior built on prior open-source
+The Android client re-implements protocol and behavior built on prior community
 reverse-engineering and interoperability work:
 
 - **`johnmiddleton12/my-whoop`** — WHOOP 4.0 BLE protocol; the `WhoopProtocol` / `WhoopStore`

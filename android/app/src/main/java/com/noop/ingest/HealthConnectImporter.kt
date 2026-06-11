@@ -42,9 +42,11 @@ import kotlin.reflect.KClass
  *   - Daily "Apple-style" aggregates (steps / calories / VO2max / weight / avg-HR)
  *     -> [AppleDaily] under deviceId "apple-health".
  *   - WHOOP-style autonomic markers (resting-HR / HRV / sleep-minutes / SpO2 / respiration)
- *     -> [DailyMetric] under deviceId "my-whoop", BUT only for days that have NO existing
- *     "my-whoop" daily row. Real WHOOP data is richer (recovery/strain/stages), so we never
- *     clobber it — we only backfill days WHOOP doesn't already own.
+ *     -> [DailyMetric] under deviceId "my-whoop", BUT only for days the strap does NOT already
+ *     cover — where "cover" means either a raw "my-whoop" daily row OR a computed "my-whoop-noop"
+ *     row (the derived recovery/strain/sleep source). Strap data is richer (recovery/strain/
+ *     stages), so we never clobber it — we only backfill days the strap left empty. A strap-only
+ *     user has NO raw "my-whoop" rows, so the computed source is what marks their days as owned.
  *   - Exercise sessions -> [WorkoutRow] with source "health-connect".
  *
  * Permissions are assumed to have been granted by the UI (via the Health Connect permission
@@ -56,7 +58,17 @@ object HealthConnectImporter {
     const val SOURCE = "Health Connect"
 
     private const val WHOOP = "my-whoop"
-    private const val APPLE = "apple-health"
+    // The computed/derived source IntelligenceEngine writes recovery/strain/sleep+stages under,
+    // namely "<importedDeviceId>-noop" with importedDeviceId == WHOOP. For a strap-only WHOOP user
+    // there are NO raw "my-whoop" daily rows — the strap's nights live only here — so the backfill
+    // guard below must treat a day the strap COMPUTED as already-owned too, or the sparse HC row
+    // (recovery/strain/stages all null) shadows it and blanks Today / regresses Sleep stages (#112).
+    private const val WHOOP_COMPUTED = "$WHOOP-noop"
+    // Health Connect data is stored under its OWN source ("health-connect"), NOT the shared
+    // "apple-health" bucket — otherwise it's mis-attributed to Apple Health in the UI (issue #34).
+    // (The recovery/sleep backfill still lands under "my-whoop"; only the external-health aggregates
+    // + workouts carry this source.)
+    private const val HC_DEVICE = "health-connect"
     private const val HC_WORKOUT_SOURCE = "health-connect"
 
     /** Read window: a wide ~10-year span ending now. Health Connect itself caps retention. */
@@ -109,6 +121,10 @@ object HealthConnectImporter {
             return ImportSummary.failure(SOURCE, "Health Connect is not available on this device.")
         }
 
+        // Refile any legacy Health Connect data that landed in the shared "apple-health" bucket before
+        // #34 BEFORE importing, so a re-import refiles cleanly instead of duplicating across both sources.
+        try { repo.refileLegacyHealthConnect() } catch (_: Exception) { /* best-effort */ }
+
         val client = client(context)
 
         // Verify the permissions really are granted (the UI may have been dismissed).
@@ -132,6 +148,10 @@ object HealthConnectImporter {
         fun bucket(day: String): DayAcc = acc.getOrPut(day) { DayAcc() }
 
         val workouts = ArrayList<WorkoutRow>()
+        // (startEpochS, endEpochS, kcal) of every active-calorie record, so an imported exercise
+        // session can be credited with the calories burned inside its window (#117). Garmin/Fit write
+        // ActiveCaloriesBurned as interval records; ExerciseSessionRecord itself carries no energy.
+        val activeKcalRecords = ArrayList<Triple<Long, Long, Double>>()
 
         try {
             // --- Steps ---
@@ -145,6 +165,7 @@ object HealthConnectImporter {
             // --- Active calories burned ---
             readAll(client, ActiveCaloriesBurnedRecord::class, filter) { r ->
                 bucket(dayOf(r.startTime)).activeKcal += r.energy.inKilocalories
+                activeKcalRecords.add(Triple(r.startTime.epochSecond, r.endTime.epochSecond, r.energy.inKilocalories))
             }
             // --- Heart rate (instantaneous samples) -> per-day average ---
             readAll(client, HeartRateRecord::class, filter) { r ->
@@ -211,13 +232,13 @@ object HealthConnectImporter {
                 val endS = r.endTime.epochSecond
                 workouts.add(
                     WorkoutRow(
-                        deviceId = APPLE,
+                        deviceId = HC_DEVICE,
                         startTs = startS,
                         endTs = endS,
                         sport = exerciseName(r),
                         source = HC_WORKOUT_SOURCE,
                         durationS = (endS - startS).toDouble().coerceAtLeast(0.0),
-                        energyKcal = null,
+                        energyKcal = sumActiveKcalInWindow(activeKcalRecords, startS, endS),
                         avgHr = null,
                         maxHr = null,
                         strain = null,
@@ -228,6 +249,38 @@ object HealthConnectImporter {
                 )
                 // Count exercises per local day on the start day for the WHOOP daily backfill.
                 bucket(dayOf(r.startTime)).exerciseCount += 1
+            }
+
+            // Fill per-workout HR (#77): an ExerciseSessionRecord carries no summary HR, so avg/max
+            // were stored null and every imported workout showed "–". Intersect each session's window
+            // with its HeartRateRecord samples — a targeted per-session read, bounded by workout count
+            // (the day-aggregate HeartRateRecord pass above streams the full range and must not be
+            // buffered). readAll swallows a per-session failure, so one bad session can't fail the
+            // import. ≥60 samples (~1 min) required so a few strays can't fabricate an average.
+            for (i in workouts.indices) {
+                val w = workouts[i]
+                if (w.endTs <= w.startTs) continue
+                var sum = 0L
+                var n = 0L
+                var max = 0L
+                readAll(
+                    client, HeartRateRecord::class,
+                    TimeRangeFilter.between(
+                        Instant.ofEpochSecond(w.startTs), Instant.ofEpochSecond(w.endTs)
+                    ),
+                ) { hr ->
+                    for (s in hr.samples) {
+                        sum += s.beatsPerMinute
+                        n += 1
+                        if (s.beatsPerMinute > max) max = s.beatsPerMinute
+                    }
+                }
+                if (n >= 60) {
+                    workouts[i] = w.copy(
+                        avgHr = round(sum.toDouble() / n).toInt(),
+                        maxHr = max.toInt(),
+                    )
+                }
             }
         } catch (e: Exception) {
             return ImportSummary.failure(SOURCE, "Health Connect read failed: ${e.message}")
@@ -241,12 +294,13 @@ object HealthConnectImporter {
             )
         }
 
-        // Existing WHOOP-owned days: read ONCE so we never clobber richer WHOOP daily rows.
-        val whoopDays: Set<String> = try {
-            repo.days(WHOOP).map { it.day }.toSet()
-        } catch (e: Exception) {
-            emptySet()
-        }
+        // Days the strap already covers: read ONCE so we never clobber richer strap data. This is
+        // the UNION of raw imported "my-whoop" rows AND computed "my-whoop-noop" rows — the latter
+        // is the ONLY source for a strap-only WHOOP user (no raw daily rows exist), so without it
+        // the sparse HC backfill (recovery/strain/stages = null) shadows the computed day and blanks
+        // Today / regresses Sleep stages (#112). Each read is wrapped so a missing source is empty,
+        // not fatal; HC still gap-fills any day the strap did NOT cover.
+        val coveredDays: Set<String> = strapDays(repo, WHOOP) + strapDays(repo, WHOOP_COMPUTED)
 
         val appleRows = ArrayList<AppleDaily>(acc.size)
         val dailyRows = ArrayList<DailyMetric>(acc.size)
@@ -258,7 +312,7 @@ object HealthConnectImporter {
             if (hasApple) {
                 appleRows.add(
                     AppleDaily(
-                        deviceId = APPLE,
+                        deviceId = HC_DEVICE,
                         day = day,
                         steps = if (a.steps > 0L) a.steps.toInt() else null,
                         activeKcal = if (a.activeKcal > 0.0) round1(a.activeKcal) else null,
@@ -273,8 +327,8 @@ object HealthConnectImporter {
             }
 
             // DailyMetric (my-whoop): resting-HR / HRV / sleep-minutes / SpO2 / respiration,
-            // ONLY for days WHOOP does not already own.
-            if (day !in whoopDays) {
+            // ONLY for days the strap does not already cover (raw OR computed).
+            if (day !in coveredDays) {
                 val rhr = if (a.rhrCount > 0) round(a.rhrSum.toDouble() / a.rhrCount).toInt() else null
                 val hrv = if (a.hrvCount > 0) round1(a.hrvSum / a.hrvCount) else null
                 val sleep = if (a.hasSleep) round1(a.sleepMin) else null
@@ -303,7 +357,7 @@ object HealthConnectImporter {
         // Persist. Register the devices we write under so name() lookups resolve.
         try {
             if (appleRows.isNotEmpty()) {
-                repo.upsertDevice(APPLE, name = "Apple Health")
+                repo.upsertDevice(HC_DEVICE, name = "Health Connect")
                 repo.upsertAppleDaily(appleRows)
             }
             if (dailyRows.isNotEmpty()) {
@@ -356,19 +410,50 @@ object HealthConnectImporter {
         onRecord: (T) -> Unit,
     ) {
         var pageToken: String? = null
-        do {
-            val response = client.readRecords(
-                ReadRecordsRequest(
-                    recordType = type,
-                    timeRangeFilter = filter,
-                    pageSize = PAGE_SIZE,
-                    pageToken = pageToken,
+        try {
+            do {
+                val response = client.readRecords(
+                    ReadRecordsRequest(
+                        recordType = type,
+                        timeRangeFilter = filter,
+                        pageSize = PAGE_SIZE,
+                        pageToken = pageToken,
+                    )
                 )
-            )
-            for (record in response.records) onRecord(record)
-            pageToken = response.pageToken
-        } while (pageToken != null)
+                for (record in response.records) onRecord(record)
+                pageToken = response.pageToken
+            } while (pageToken != null)
+        } catch (e: Exception) {
+            // One record type failing (e.g. a device/SDK validation quirk like "count must not be less
+            // than 1" seen on some Health Connect builds) must NOT abort the whole import — log it and
+            // keep whatever was read, so every other data type still comes in (issue #34). The reads
+            // accumulate into shared buckets, so a partial type is simply absent, never corrupt.
+            android.util.Log.w("HealthConnect", "read of ${type.simpleName} failed; skipping: ${e.message}")
+        }
     }
+
+    // MARK: - strap-coverage helpers
+
+    /**
+     * The set of "YYYY-MM-DD" days the strap already covers under [deviceId], read defensively:
+     * a missing/empty source (the normal case for raw "my-whoop" on a strap-only user) yields an
+     * empty set rather than throwing. The caller unions the raw and computed sources (#112).
+     */
+    private suspend fun strapDays(repo: WhoopRepository, deviceId: String): Set<String> =
+        try {
+            coveredDaySet(repo.days(deviceId))
+        } catch (e: Exception) {
+            emptySet()
+        }
+
+    /**
+     * Pure mapper: the distinct local days carried by [rows]. Factored out (and internal) so the
+     * #112 skip-set semantics — a strap-only user is covered by their COMPUTED rows — can be
+     * unit-tested without Room/Context. Unioning two of these (raw + computed) is what stops the
+     * sparse Health Connect backfill from shadowing a day the strap already covered.
+     */
+    internal fun coveredDaySet(rows: List<DailyMetric>): Set<String> =
+        rows.mapTo(HashSet()) { it.day }
 
     // MARK: - field mapping helpers
 
@@ -400,6 +485,30 @@ object HealthConnectImporter {
     }
 
     /**
+     * Active-calorie kcal attributable to an exercise session: for every active-calorie record that
+     * overlaps [startS, endS], credit the kcal in proportion to the overlap fraction. Time-weighting
+     * (not a flat overlap test) means a per-minute record fully inside the session counts in full,
+     * while a day-spanning total record only contributes the session's slice — so neither under- nor
+     * grossly over-credits. Returns null when nothing overlaps, so an energy-less session stays blank
+     * rather than showing 0. (#117)
+     */
+    internal fun sumActiveKcalInWindow(
+        records: List<Triple<Long, Long, Double>>,
+        startS: Long,
+        endS: Long,
+    ): Double? {
+        if (endS <= startS) return null
+        var total = 0.0
+        for ((rStart, rEnd, kcal) in records) {
+            val overlap = minOf(endS, rEnd) - maxOf(startS, rStart)
+            if (overlap <= 0L) continue
+            val recLen = (rEnd - rStart).coerceAtLeast(1L)
+            total += kcal * (overlap.toDouble() / recLen.toDouble())
+        }
+        return total.takeIf { it > 0.0 }
+    }
+
+    /**
      * A short, human sport name for a Health Connect exercise session. Uses the user's title
      * if present, else maps the EXERCISE_TYPE_* int to a readable label, else "Workout".
      */
@@ -410,33 +519,35 @@ object HealthConnectImporter {
     }
 
     /**
-     * Minimal, stable map of common ExerciseSessionRecord.EXERCISE_TYPE_* constants to labels.
-     * The constants are stable public ints; unknown/other types fall back to "Workout".
-     * (We hardcode the int values to avoid a brittle dependency on every constant existing
-     * across connect-client patch versions; values are from the published EXERCISE_TYPE_* set.)
+     * Map of common ExerciseSessionRecord.EXERCISE_TYPE_* constants to readable labels. We reference the
+     * library constants directly rather than hardcoding ints — the old hardcoded values were WRONG (e.g.
+     * 79 was mapped to "Swimming" but 79 is actually WALKING, so a walking session showed as swimming —
+     * issue #53; 80 was "Swimming" but is WATER_POLO; 82 was "Walking" but is WHEELCHAIR; etc.). Using
+     * the constants makes the int↔label mapping impossible to get wrong, and a renamed/removed constant
+     * becomes a compile error instead of a silent mismatch. Unknown types fall back to "Workout".
      */
     private val EXERCISE_TYPE_NAMES: Map<Int, String> = mapOf(
-        56 to "Running",
-        57 to "Running",          // RUNNING_TREADMILL
-        8 to "Cycling",           // BIKING
-        9 to "Cycling",           // BIKING_STATIONARY
-        79 to "Swimming",         // SWIMMING_OPEN_WATER
-        80 to "Swimming",         // SWIMMING_POOL
-        70 to "Strength",         // STRENGTH_TRAINING
-        82 to "Walking",          // WALKING
-        90 to "Yoga",             // YOGA
-        53 to "Rowing",           // ROWING
-        54 to "Rowing",           // ROWING_MACHINE
-        37 to "HIIT",             // HIGH_INTENSITY_INTERVAL_TRAINING
-        25 to "Elliptical",       // ELLIPTICAL
-        48 to "Pilates",          // PILATES
-        13 to "Boxing",           // BOXING
-        33 to "Hiking",           // HIKING
-        2 to "Badminton",         // BADMINTON
-        4 to "Baseball",          // BASEBALL
-        5 to "Basketball",        // BASKETBALL
-        64 to "Soccer",           // SOCCER
-        87 to "Weightlifting",    // WEIGHTLIFTING
+        ExerciseSessionRecord.EXERCISE_TYPE_RUNNING to "Running",
+        ExerciseSessionRecord.EXERCISE_TYPE_RUNNING_TREADMILL to "Running",
+        ExerciseSessionRecord.EXERCISE_TYPE_BIKING to "Cycling",
+        ExerciseSessionRecord.EXERCISE_TYPE_BIKING_STATIONARY to "Cycling",
+        ExerciseSessionRecord.EXERCISE_TYPE_SWIMMING_OPEN_WATER to "Swimming",
+        ExerciseSessionRecord.EXERCISE_TYPE_SWIMMING_POOL to "Swimming",
+        ExerciseSessionRecord.EXERCISE_TYPE_STRENGTH_TRAINING to "Strength",
+        ExerciseSessionRecord.EXERCISE_TYPE_WALKING to "Walking",
+        ExerciseSessionRecord.EXERCISE_TYPE_HIKING to "Hiking",
+        ExerciseSessionRecord.EXERCISE_TYPE_YOGA to "Yoga",
+        ExerciseSessionRecord.EXERCISE_TYPE_ROWING to "Rowing",
+        ExerciseSessionRecord.EXERCISE_TYPE_ROWING_MACHINE to "Rowing",
+        ExerciseSessionRecord.EXERCISE_TYPE_HIGH_INTENSITY_INTERVAL_TRAINING to "HIIT",
+        ExerciseSessionRecord.EXERCISE_TYPE_ELLIPTICAL to "Elliptical",
+        ExerciseSessionRecord.EXERCISE_TYPE_PILATES to "Pilates",
+        ExerciseSessionRecord.EXERCISE_TYPE_BOXING to "Boxing",
+        ExerciseSessionRecord.EXERCISE_TYPE_BADMINTON to "Badminton",
+        ExerciseSessionRecord.EXERCISE_TYPE_BASEBALL to "Baseball",
+        ExerciseSessionRecord.EXERCISE_TYPE_BASKETBALL to "Basketball",
+        ExerciseSessionRecord.EXERCISE_TYPE_SOCCER to "Soccer",
+        ExerciseSessionRecord.EXERCISE_TYPE_WEIGHTLIFTING to "Weightlifting",
     )
 
     private fun round1(x: Double) = round(x * 10.0) / 10.0

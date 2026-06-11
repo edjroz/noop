@@ -56,23 +56,43 @@ final class Backfiller {
     private var chunk: [[UInt8]] = []
     /// Whether a START has been received and we're accumulating a chunk.
     private var chunkOpen = false
+    /// Strap family for the current offload, set at begin(). Drives family-aware frame parsing (WHOOP 5/MG
+    /// records sit at +4 offsets vs WHOOP 4.0) and the end_data slice the ack needs. Captured at begin()
+    /// rather than init so it's correct even if the Backfiller was constructed before the strap was known.
+    private var family: DeviceFamily = .whoop4
+
+    /// Diagnostic sink (strap log). Surfaces historical records whose firmware layout we can't decode.
+    private let log: ((String) -> Void)?
+    /// Versions already reported this session, so the diagnostic logs each once (no spam).
+    private var loggedUnmappedVersions: Set<Int> = []
+
+    /// Durably archives undecodable record frames BEFORE the trim ack (#77 / #91). Returns true once
+    /// the bytes are safe (written OR cap-reached — either way the chunk may be acked) and false on a
+    /// genuine write failure, in which case `finishChunk` holds the cursor/ack so the strap re-sends.
+    /// nil in non-production inits (tests/preview) → archiving is skipped and acks proceed as before.
+    private let rejectedSink: ((_ frames: [[UInt8]], _ trim: UInt32, _ family: DeviceFamily) -> Bool)?
 
     init(store: BackfillStoreWriting,
          deviceId: String,
          ackTrim: @escaping (_ trim: UInt32, _ endData: [UInt8]) -> Void,
          enableRawCapture: Bool = false,
+         log: ((String) -> Void)? = nil,
+         rejectedSink: ((_ frames: [[UInt8]], _ trim: UInt32, _ family: DeviceFamily) -> Bool)? = nil,
          extract: @escaping Extractor = { extractHistoricalStreams($0, deviceClockRef: $1, wallClockRef: $2) }) {
         self.store = store
         self.deviceId = deviceId
         self.ackTrim = ackTrim
         self.enableRawCapture = enableRawCapture
+        self.log = log
+        self.rejectedSink = rejectedSink
         self.extract = extract
     }
 
     /// Called by BLEManager when the strap signals a historical offload is beginning.
     /// chunkOpen starts TRUE: the high-freq-sync biometric replay streams records immediately and
     /// sends one HISTORY_START then repeated HISTORY_ENDs, so we must accumulate from the outset.
-    func begin() {
+    func begin(family: DeviceFamily) {
+        self.family = family
         isBackfilling = true
         chunk.removeAll(keepingCapacity: true)
         chunkOpen = true
@@ -80,7 +100,7 @@ final class Backfiller {
 
     /// Feed one raw BLE frame into the state machine. May trigger async store operations.
     func ingest(_ frame: [UInt8]) async {
-        switch classifyHistoricalMeta(parseFrame(frame)) {
+        switch classifyHistoricalMeta(parseFrame(frame, family: family)) {
         case .start:
             isBackfilling = true
             chunk.removeAll(keepingCapacity: true)
@@ -101,9 +121,13 @@ final class Backfiller {
     /// trim cursor = the first u32 of end_data (data[10:14]). Returns nil if the frame is too
     /// short to contain the field (shouldn't happen for a real HISTORY_END, which is >=14 data
     /// bytes, but guards against a malformed frame).
-    static func endData(from frame: [UInt8]) -> [UInt8]? {
-        guard frame.count >= 25 else { return nil }
-        return Array(frame[17..<25])
+    static func endData(from frame: [UInt8], family: DeviceFamily) -> [UInt8]? {
+        // metadata.data begins at frame[7] (WHOOP4) / frame[11] (WHOOP5, the +4 puffin envelope); the
+        // ack's end_data = data[10:18] → frame[17:25] (WHOOP4) or frame[21:29] (WHOOP5). The WHOOP5 slice
+        // is verified on a real HISTORY_END (trim=112193 = frame[21..25]) in Whoop5HistoricalTests.
+        let start = family == .whoop5 ? 21 : 17
+        guard frame.count >= start + 8 else { return nil }
+        return Array(frame[start..<(start + 8)])
     }
 
     /// Commit one HISTORY_END chunk: (persist decoded → enqueueRaw when present) → setCursor → ackTrim.
@@ -116,7 +140,7 @@ final class Backfiller {
     /// records is still acked (it advances the strap's trim) — that's how the offload progresses.
     /// `endFrame` carries the 8-byte `end_data` the ack requires.
     private func finishChunk(unix: UInt32, trim: UInt32, endFrame: [UInt8]) async {
-        guard let endData = Backfiller.endData(from: endFrame) else { return }
+        guard let endData = Backfiller.endData(from: endFrame, family: family) else { return }
 
         let frames = chunk
         chunk.removeAll(keepingCapacity: true)   // next records accumulate into the next chunk
@@ -129,9 +153,60 @@ final class Backfiller {
             // decodes to correct wall time, and we can persist + ack + upload. The correlation is only
             // truly required to map REALTIME (type-40/43) device-epoch timestamps, never in a hist chunk.
             let ref = clockRef ?? { let now = Int(Date().timeIntervalSince1970); return ClockRef(device: now, wall: now) }()
-            let parsed = frames.map { parseFrame($0) }
+            let parsed = frames.map { parseFrame($0, family: family) }
+            // Diagnostic (#30): a historical record whose firmware version we don't have a field map for
+            // bails out of decode entirely — no HR, no R-R, no GRAVITY — so sleep (which is gravity/
+            // motion-driven) can never be computed from it, even though the offload "completes". Surface
+            // each unmapped version once so the user's strap log reveals what their firmware emits.
+            for p in parsed {
+                guard let v = p.parsed["hist_version"]?.intValue,
+                      p.parsed["heart_rate"] == nil,            // decoded nothing → unmapped layout
+                      !loggedUnmappedVersions.contains(v) else { continue }
+                loggedUnmappedVersions.insert(v)
+                log?("Historical records use firmware layout v\(v), which NOOP doesn't decode yet — no motion data, so sleep can't be computed from the strap. Please report this (issue #30).")
+            }
             let decoded = extract(parsed, ref.device, ref.wall)
+            // Diagnostic (#77): the AGGREGATE silent-loss case — frames arrived but produced no rows at
+            // all (CRC fail / unmapped layout / out-of-range timestamp), so this chunk persists nothing
+            // yet still acks below and the strap trims past it. The per-version log above only catches
+            // unmapped layouts; this catches CRC drops too. Observability only — behaviour unchanged
+            // (not acking would wedge the offload on a re-send loop). Surfaces in the user's strap log.
+            // Classify FIRST: separate genuinely-undecodable SENSOR records from the strap's own
+            // type-50 console/diagnostic frames, which decode to 0 rows by design and are NOT a loss
+            // (the "rejected frames" red herring users kept reporting — #77/#120). Drives both the
+            // log wording below and the archive guard further down.
+            let rejected = rejectedHistoricalRecords(frames, family: family)
+            if decoded.isEmpty {
+                if rejected.isEmpty {
+                    // Benign: the chunk was the strap narrating its own state (console logs), not
+                    // sensor data. Keep the wording calm so it doesn't read as data loss.
+                    log?("Backfill: \(frames.count) frame(s) this chunk carried no sensor records (strap console/diagnostic output) — normal, nothing to persist (trim=\(trim)).")
+                } else {
+                    log?("Backfill: \(frames.count) frame(s) decoded to 0 rows (trim=\(trim)); \(rejected.count) undecodable sensor record(s) — archiving raw bytes before ack (CRC/unmapped layout).")
+                    // #91: dump a hex sample of the GENUINE rejects (not console frames) so an unmapped
+                    // firmware's record layout can be mapped from a user's strap log.
+                    for (i, f) in rejected.prefix(3).enumerated() {
+                        let hex = f.prefix(64).map { String(format: "%02x", $0) }.joined()
+                        log?("Backfill: rejected frame[\(i)] \(f.count)B: \(hex)\(f.count > 64 ? "…" : "")")
+                    }
+                }
+            }
+            // Commit the decoded rows FIRST (durable). Doing this before the reject archive means a
+            // rare insert failure — which returns and re-sends the whole chunk next session — can't
+            // leave duplicate lines in the append-only reject archive.
             do { try await store.insert(decoded, deviceId: deviceId) } catch { return }
+
+            // #77 / #91: any genuinely-undecodable type-47 record in this chunk must be ARCHIVED
+            // before we ack — the ack frees the strap's copy, so the archive is the only remaining
+            // copy of an unmapped firmware's records. A genuine archive write FAILURE aborts the
+            // chunk (no setCursor, no ack) so the strap re-sends it next session — no data loss
+            // either way. (A full archive is reported as success by the sink; we still ack.)
+            if !rejected.isEmpty, let rejectedSink {
+                guard rejectedSink(rejected, trim, family) else {
+                    log?("Backfill: rejected-frame archive failed (trim=\(trim)) — holding ack so the strap re-sends.")
+                    return
+                }
+            }
 
             // RAW: only persisted when the research toggle is ON. Default OFF → decoded-only; the
             // chunk is still durably committed (decoded) so the trim is safe to advance + ack.

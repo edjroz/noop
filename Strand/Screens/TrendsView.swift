@@ -62,16 +62,15 @@ struct TrendsView: View {
         return date(d)
     }
 
-    /// Days for a given range, taken RELATIVE TO THE LATEST day (not "now").
-    /// `.all` returns everything.
+    /// Days for a given range, taken RELATIVE TO TODAY (the phone's local date) — not the latest
+    /// recorded day, which on a stale import anchored W/M/3M to months-old data so it looked current
+    /// (issue #23). Empty short windows auto-widen (see `resolve`), so old imports surface under a
+    /// wider range / All history instead of masquerading as recent. `.all` returns everything.
+    /// ISO yyyy-MM-dd compares chronologically.
     private func days(for r: Range) -> [DailyMetric] {
         guard let n = r.days else { return repo.days }
-        guard let last = latestDay else { return [] }
-        let cutoff = last.addingTimeInterval(-Double(n - 1) * 86_400)
-        return repo.days.filter { d in
-            guard let dt = date(d.day) else { return false }
-            return dt >= cutoff
-        }
+        let cutoffKey = Repository.localDayKey(Calendar.current.date(byAdding: .day, value: -(n - 1), to: Date()) ?? Date())
+        return repo.days.filter { $0.day >= cutoffKey }
     }
 
     /// Build trend points from a metric accessor over a day slice.
@@ -276,7 +275,7 @@ struct TrendsView: View {
 
     @ViewBuilder
     private func metricChart(
-        title: String, unit: String,
+        title: LocalizedStringKey, unit: String,
         points pts: [TrendPoint],
         subtitle: String,
         gradient: Gradient,
@@ -324,7 +323,7 @@ struct TrendsView: View {
         let title = (range == .all && repo.days.count > 365) ? "Recovery — all history" : "Recovery — past year"
         return NoopCard {
             VStack(alignment: .leading, spacing: 12) {
-                SectionHeader(title, overline: "Calendar", trailing: "\(recoveryDays.filter { $0.score != nil }.count) days")
+                SectionHeader("\(title)", overline: "Calendar", trailing: "\(recoveryDays.filter { $0.score != nil }.count) days")
                 if recoveryDays.isEmpty {
                     sparsePlaceholder.frame(height: 120)
                 } else {

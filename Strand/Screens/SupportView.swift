@@ -43,7 +43,7 @@ struct SupportView: View {
                     Image(systemName: "hands.clap.fill").foregroundStyle(StrandPalette.accent).accessibilityHidden(true)
                     Text("Built on").font(StrandFont.headline).foregroundStyle(StrandPalette.textPrimary)
                 }
-                Text("This stands on open-source reverse-engineering. Huge thanks:")
+                Text("This stands on community reverse-engineering. Huge thanks:")
                     .font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
                 ForEach(ProjectInfo.attributions, id: \.repo) { a in
                     HStack(spacing: 8) {

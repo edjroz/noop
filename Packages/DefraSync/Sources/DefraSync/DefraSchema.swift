@@ -45,6 +45,8 @@ public enum DefraSchema {
       spo2Pct: Float
       skinTempDevC: Float
       respRateBpm: Float
+      steps: Int
+      activeKcalEst: Float
       lastWriterPeer: String
       lastWriterTs: Int
     }

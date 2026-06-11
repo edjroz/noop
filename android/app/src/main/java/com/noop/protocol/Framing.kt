@@ -41,8 +41,17 @@ private fun ByteArray.u32(off: Int): Long? {
  * A complete frame is `length + 4` bytes where `length` = u16 LE at buf[1..3]. Leading bytes before
  * the 0xAA SOF are discarded. Mirrors framing.py / Swift `Reassembler`.
  */
-class Reassembler {
+class Reassembler(private val family: DeviceFamily = DeviceFamily.WHOOP4) {
     private val buf = ArrayList<Byte>()
+
+    /**
+     * Drop any partial-frame remnant. Called on (re)connect so a stalled or garbage frame from one
+     * session can't wedge the live stream in the next. The macOS BLEManager achieves the same by
+     * reassigning a fresh `Reassembler` on every connect (BLEManager.swift:183).
+     */
+    fun reset() {
+        buf.clear()
+    }
 
     /** Feed one fragment; return zero or more complete frames now available, in order. */
     fun feed(fragment: ByteArray): List<ByteArray> {
@@ -59,14 +68,38 @@ class Reassembler {
                 repeat(sof) { buf.removeAt(0) }
             }
             if (buf.size < 4) break
-            val length = (buf[1].toInt() and 0xFF) or ((buf[2].toInt() and 0xFF) shl 8)
-            val total = length + 4
+            // Frame length is encoded differently per family: WHOOP4 = u16 @[1..3], total = length + 4;
+            // WHOOP5/MG ("puffin") = declaredLength u16 @[2..4], total = declaredLength + 8 (it counts
+            // the payload + the 4-byte CRC32 trailer, and has 2 extra header bytes). Using the WHOOP4
+            // formula on a 5/MG frame decodes a bogus 6 KB length and the live stream never emits.
+            val length: Int
+            val total: Int
+            if (family == DeviceFamily.WHOOP5) {
+                length = (buf[2].toInt() and 0xFF) or ((buf[3].toInt() and 0xFF) shl 8)
+                total = length + 8
+            } else {
+                length = (buf[1].toInt() and 0xFF) or ((buf[2].toInt() and 0xFF) shl 8)
+                total = length + 4
+            }
+            if (total > MAX_FRAME_BYTES) {
+                // A corrupt or misaligned SOF decodes an impossibly large length and we'd wait forever
+                // for bytes that can never arrive over BLE — the live stream would freeze until a
+                // reconnect. The largest real WHOOP frame is ~1920 B, so anything past the 8 KB ceiling
+                // is garbage: drop this 0xAA and resync to the next one.
+                buf.removeAt(0)
+                continue
+            }
             if (buf.size < total) break
             val frame = ByteArray(total) { buf[it] }
             out.add(frame)
             repeat(total) { buf.removeAt(0) }
         }
         return out
+    }
+
+    private companion object {
+        /** ~4× the largest observed WHOOP frame (~1920 B raw/historical); above this is a bad length. */
+        const val MAX_FRAME_BYTES = 8192
     }
 }
 
@@ -147,6 +180,16 @@ object Framing {
     private fun commandLabel(v: Int): String =
         CommandNumber.fromRaw(v)?.let { "${it.name}($v)" } ?: hexLabel(v)
 
+    /** 5/MG COMMAND_RESPONSE result codes. 3=UNSUPPORTED matches our own MG haptics-rejection
+     *  capture (#48); 2=PENDING precedes SUCCESS on GET_DATA_RANGE (hardware-confirmed, #78 fork). */
+    private fun commandResultLabel(v: Int): String = when (v) {
+        0 -> "FAILURE(0)"
+        1 -> "SUCCESS(1)"
+        2 -> "PENDING(2)"
+        3 -> "UNSUPPORTED(3)"
+        else -> hexLabel(v)
+    }
+
     private fun hexLabel(v: Int): String = "0x%02X(%d)".format(v, v)
 
     // MARK: - parse
@@ -190,9 +233,115 @@ object Framing {
         val innerStart = 8
         val t = frame[innerStart].toInt() and 0xFF
         val name = typeName(t)
-        // Whoop 5.0 biometric field offsets are a later milestone — expose the inner record without
-        // inventing offsets (matches the Swift port). `parsed` stays empty for now.
-        return ParsedFrame(ok = true, crcOk = check.crc32Ok, typeName = name, parsed = emptyMap())
+        val parsed = LinkedHashMap<String, Any?>()
+        // WHOOP 5.0 field offsets are the 4.0 layout shifted by +4 (inner record starts at byte 8 vs 4).
+        // REALTIME_DATA is hardware-verified at +4 (HR matched the 0x2A37 profile to ~0.4 bpm over 96
+        // worn frames; see the Swift Whoop5RealtimeTests vector). Other types stay envelope-only until
+        // their per-type 5.0 offsets are confirmed on hardware — we don't invent offsets.
+        when (name) {
+            "REALTIME_DATA" -> decodeRealtimeWhoop5(frame, parsed)
+            "METADATA" -> decodeMetadataWhoop5(frame, parsed)
+            "EVENT" -> decodeEventWhoop5(frame, parsed)
+            "COMMAND_RESPONSE" -> decodeCommandResponseWhoop5(frame, parsed)
+            "CONSOLE_LOGS" -> decodeConsoleLogsWhoop5(frame, parsed)
+            else -> Unit
+        }
+        return ParsedFrame(ok = true, crcOk = check.crc32Ok, typeName = name, parsed = parsed)
+    }
+
+    /**
+     * EVENT (type 48) for WHOOP 5.0/MG — the 4.0 layout + 4: event@10 (u8, EventNumber),
+     * event_timestamp@12 (u32), opaque payload bytes @16..size-4 (kept as hex for protocol research —
+     * real captures show uncatalogued events, e.g. 0x1D(29) with a 16-byte payload). For
+     * BATTERY_LEVEL the 4.0 payload decode shifts with it: soc%=u16@21/10, mV=u16@25, charging@30
+     * bit0 (mirrors Swift Interpreter's whoop5 event decode; all gated, fail closed). (#78 fork)
+     */
+    private fun decodeEventWhoop5(frame: ByteArray, parsed: MutableMap<String, Any?>) {
+        val evVal = frame.u8(10) ?: return
+        parsed["event"] = eventLabel(evVal)
+        frame.u32(12)?.let { parsed["event_timestamp"] = it.toInt() }
+        val payEnd = frame.size - 4
+        if (payEnd > 16) {
+            parsed["event_payload_hex"] = frame.copyOfRange(16, payEnd)
+                .joinToString("") { "%02x".format(it) }
+        }
+        if (EventNumber.fromRaw(evVal) == EventNumber.BATTERY_LEVEL) {
+            frame.u16(21)?.let { raw -> if (raw <= 1100) parsed["battery_pct"] = raw.toDouble() / 10.0 }
+            frame.u16(25)?.let { mv -> if (mv in 3000..4300) parsed["battery_mV"] = mv }
+            frame.u8(30)?.let { ch -> if (ch <= 1) parsed["battery_charging"] = ch and 1 }
+        }
+    }
+
+    /**
+     * COMMAND_RESPONSE (puffin type 36 alias) for WHOOP 5.0/MG: resp_cmd@10 (u8, CommandNumber),
+     * resp_seq@11 (u8), result@12 (u8 → FAILURE/SUCCESS/PENDING/UNSUPPORTED). GET_DATA_RANGE
+     * typically answers PENDING then SUCCESS; the result codes are hardware-confirmed (#78 fork,
+     * and 3=UNSUPPORTED matches our own MG haptics rejection, #48). GET_BATTERY_LEVEL carries a
+     * direct percent at @13 (gated ≤100, fail closed; Swift parity — unused until the 5/MG
+     * allowlist grows).
+     */
+    private fun decodeCommandResponseWhoop5(frame: ByteArray, parsed: MutableMap<String, Any?>) {
+        val cmd = frame.u8(10) ?: return
+        parsed["resp_cmd"] = commandLabel(cmd)
+        frame.u8(11)?.let { parsed["resp_seq"] = it }
+        frame.u8(12)?.let { parsed["result"] = commandResultLabel(it) }
+        if (CommandNumber.fromRaw(cmd) == CommandNumber.GET_BATTERY_LEVEL) {
+            frame.u8(13)?.let { pct -> if (pct <= 100) parsed["battery_pct"] = pct.toDouble() }
+        }
+    }
+
+    /**
+     * CONSOLE_LOGS (type 50) for WHOOP 5.0/MG: 13-byte record header after the inner type byte,
+     * then UTF-8 console text @21..size-4 with an optional NUL terminator. The strap's own
+     * diagnostics channel — it narrates history syncs ("BLE: PullStats: Data: N, Events: N…",
+     * "RTC timestamp … is invalid; not saving data to flash"), which is how the clock-before-history
+     * requirement was discovered. Capped at 2 KB (matches the Swift PostHooks console hardening).
+     * (#78 fork, real-frame verified)
+     */
+    private fun decodeConsoleLogsWhoop5(frame: ByteArray, parsed: MutableMap<String, Any?>) {
+        val payEnd = frame.size - 4
+        if (payEnd <= 21) return
+        val text = frame.copyOfRange(21, payEnd)
+            .toString(Charsets.UTF_8)
+            .trimEnd('\u0000')
+        if (text.isNotEmpty()) parsed["console"] = text.take(2048)
+    }
+
+    /**
+     * METADATA (PUFFIN_METADATA, type 56) for WHOOP 5.0/MG — the 4.0 METADATA layout + 4 (the inner
+     * record starts at byte 8 vs 4): meta_type@10 (u8), and for a HISTORY_END additionally unix@11
+     * (u32), subsec@15 (u16), trim_cursor@21 (u32). Without this, parseWhoop5 left every 5/MG METADATA
+     * frame field-less, so classifyHistoricalMeta could never recognise HISTORY_END/COMPLETE → the
+     * Backfiller never acked/trimmed → 5/MG offload never completed. Offsets verified against real
+     * WHOOP 5 HISTORY_END frames (Swift decodeWhoop5Metadata, Interpreter.swift:407). (#78)
+     */
+    private fun decodeMetadataWhoop5(frame: ByteArray, parsed: MutableMap<String, Any?>) {
+        val mt = frame.u8(10) ?: return
+        parsed["meta_type"] = metaLabel(mt)
+        // Only a HISTORY_END carries unix/subsec/trim; the u-reads null out on the shorter
+        // START/COMPLETE frames, so classifyHistoricalMeta keys those off meta_type alone.
+        frame.u32(11)?.let { parsed["unix"] = it.toInt() }
+        frame.u16(15)?.let { parsed["subsec"] = it }
+        frame.u32(21)?.let { parsed["trim_cursor"] = it.toInt() }
+    }
+
+    /**
+     * REALTIME_DATA (type 40) for WHOOP 5.0 — the 4.0 layout + 4: timestamp@10 (u32),
+     * subseconds@14 (u16), heart_rate@16 (u8), rr_count@17, rr@18.. (u16). Mirrors the Swift
+     * parseFrameWhoop5 realtime decode and is covered by the same real-frame test vector.
+     */
+    private fun decodeRealtimeWhoop5(frame: ByteArray, parsed: MutableMap<String, Any?>) {
+        frame.u32(10)?.let { parsed["timestamp"] = it.toInt() }
+        frame.u16(14)?.let { parsed["subseconds"] = it }
+        frame.u8(16)?.let { parsed["heart_rate"] = it }
+        val rrn = frame.u8(17) ?: 0
+        parsed["rr_count"] = rrn
+        val rrs = ArrayList<Int>()
+        for (i in 0 until rrn) {
+            val v = frame.u16(18 + i * 2)
+            if (v != null && v > 0) rrs.add(v)   // drop 0 ms placeholders, matching 4.0 / Swift
+        }
+        parsed["rr_intervals"] = rrs
     }
 
     // MARK: - per-type decoders (Whoop 4.0). Ported from PostHooks.swift + the static field specs.
@@ -320,6 +469,68 @@ object Framing {
         frame[i++] = ((trailer ushr 8) and 0xFFL).toByte()
         frame[i++] = ((trailer ushr 16) and 0xFFL).toByte()
         frame[i] = ((trailer ushr 24) and 0xFFL).toByte()
+        return frame
+    }
+
+    /**
+     * EXPERIMENTAL: build a WHOOP 5.0/MG ("puffin") command frame in the CRC16 envelope.
+     *
+     * Direct port of the Swift `puffinCommandFrame` (WhoopProtocol/Framing.swift). The inner record
+     * is `[type][seq][cmd] + payload`; `declLen = inner.size + 4` (the CRC32 tail); the CRC16-Modbus
+     * covers the first six header bytes. `type` defaults to 35 (COMMAND) and `header` to `[0x00,
+     * 0x01]`, mirroring the structure of the only puffin frame we know a real strap accepts (the
+     * static CLIENT_HELLO). The returned frame round-trips through `parseFrame(frame, WHOOP5)`.
+     *
+     * Layout (LE = little-endian):
+     *   inner  = [type][seq][cmd] + payload
+     *   declLen = inner.size + 4
+     *   frame  = [0xAA, 0x01, declLen LE(2), header[0], header[1]]
+     *          + crc16Modbus(frame[0..6)) LE(2)
+     *          + inner
+     *          + crc32(inner) LE(4)
+     */
+    fun puffinCommandFrame(
+        cmd: Int,
+        seq: Int,
+        payload: ByteArray = byteArrayOf(0x00),
+        type: Int = PacketType.COMMAND.rawValue,   // 35
+        header: ByteArray = byteArrayOf(0x00, 0x01),
+    ): ByteArray {
+        val inner0 = ByteArray(3 + payload.size)
+        inner0[0] = (type and 0xFF).toByte()
+        inner0[1] = (seq and 0xFF).toByte()
+        inner0[2] = (cmd and 0xFF).toByte()
+        System.arraycopy(payload, 0, inner0, 3, payload.size)
+        // Pad the inner record to a 4-byte boundary before length/CRC, exactly as the strap's maverick
+        // framing does (pad4). No-op for the 4-aligned commands shipped so far (toggle HR, historical),
+        // but REQUIRED for the 12-byte haptics payload (inner 15 -> 16) — otherwise the declared length
+        // and CRC32 cover the wrong byte count and the strap rejects the frame (#48).
+        val pad = (4 - inner0.size % 4) % 4
+        val inner = if (pad == 0) inner0 else inner0 + ByteArray(pad)
+
+        val declLen = inner.size + 4
+
+        // Six-byte header: SOF, format byte, declLen LE(2), header(2). CRC16-Modbus is over these.
+        val head = ByteArray(6)
+        head[0] = 0xAA.toByte()
+        head[1] = 0x01
+        head[2] = (declLen and 0xFF).toByte()
+        head[3] = ((declLen ushr 8) and 0xFF).toByte()
+        head[4] = header[0]
+        head[5] = header[1]
+        val c16 = Crc.crc16Modbus(head)
+        val c32 = Crc.crc32(inner)
+
+        val frame = ByteArray(6 + 2 + inner.size + 4)
+        var i = 0
+        System.arraycopy(head, 0, frame, i, 6); i += 6
+        frame[i++] = (c16 and 0xFF).toByte()
+        frame[i++] = ((c16 ushr 8) and 0xFF).toByte()
+        System.arraycopy(inner, 0, frame, i, inner.size); i += inner.size
+        frame[i++] = (c32 and 0xFFL).toByte()
+        frame[i++] = ((c32 ushr 8) and 0xFFL).toByte()
+        frame[i++] = ((c32 ushr 16) and 0xFFL).toByte()
+        frame[i] = ((c32 ushr 24) and 0xFFL).toByte()
         return frame
     }
 }
