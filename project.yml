@@ -87,6 +87,15 @@ targets:
       - package: StrandImport
       - package: StrandDesign
       - package: DefraSync
+    preBuildScripts:
+      # Phase 3: keep DefraEmbed.xcframework current relative to the Go module so SwiftPM's
+      # .binaryTarget always resolves. The script's own timestamp guard short-circuits when
+      # nothing in Packages/DefraSync/defradb-embed/ is newer than the existing framework, so
+      # warm incremental builds add a few hundred ms; source changes trigger a real rebuild.
+      - name: Ensure DefraEmbed.xcframework is built
+        script: |
+          "${SRCROOT}/Tools/defradb-embed/build.sh"
+        showEnvVarsInLog: false
   StrandTests:
     type: bundle.unit-test
     platform: macOS

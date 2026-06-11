@@ -18,6 +18,21 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && cd .. && pwd)"
 EMBED_DIR="${REPO_ROOT}/Packages/DefraSync/defradb-embed"
 OUT_DIR="${REPO_ROOT}/Packages/DefraSync/DefraEmbed.xcframework"
+
+# Fast path: when nothing in the Go module is newer than the framework, skip the
+# rebuild entirely. Lets us wire this as an Xcode pre-build script without paying
+# the ~10s lipo+xcframework cost on every Cmd-B. Force with FORCE_REBUILD=1.
+if [[ "${FORCE_REBUILD:-0}" != "1" && -f "${OUT_DIR}/Info.plist" ]]; then
+    NEWEST=$(find "${EMBED_DIR}" -name '*.go' -o -name 'go.mod' -o -name 'go.sum' \
+        | xargs -I {} stat -f '%m' {} 2>/dev/null | sort -nr | head -1)
+    FW_MTIME=$(stat -f '%m' "${OUT_DIR}/Info.plist" 2>/dev/null || echo 0)
+    if [[ -n "${NEWEST}" && "${NEWEST}" -le "${FW_MTIME}" ]]; then
+        echo "→ DefraEmbed.xcframework is up to date (no Go sources newer than the framework) — skipping rebuild"
+        echo "→ Force with FORCE_REBUILD=1 ${0##*/}"
+        exit 0
+    fi
+fi
+
 STAGE_DIR="$(mktemp -d -t defradb-embed-build.XXXXXX)"
 trap 'rm -rf "${STAGE_DIR}"' EXIT
 
